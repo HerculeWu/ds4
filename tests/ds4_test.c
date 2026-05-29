@@ -1077,7 +1077,12 @@ static void test_local_golden_vectors(void) {
     char *saved_prefill_chunk = test_save_env("DS4_METAL_PREFILL_CHUNK");
     char *saved_disable_metal4 = test_save_env("DS4_METAL_DISABLE_METAL4");
     char *saved_moe_tile_max = test_save_env("DS4_METAL_MOE_TILE_MAX");
-    setenv("DS4_METAL_PREFILL_CHUNK", "4096", 1);
+    /* PHASE 3: on the 6 GB CUDA floor model, pc=4096 activations (3.885 GiB)
+       OOM alongside the slotbank slab. The VRAM-aware cap clamps this down, but
+       set a fitting chunk explicitly so the intent is visible and the Metal
+       reference path is unaffected by the CUDA-only clamp. Chunked prefill is a
+       KV-accumulation boundary, not a numeric change. */
+    setenv("DS4_METAL_PREFILL_CHUNK", "512", 1);
     setenv("DS4_METAL_DISABLE_METAL4", "1", 1);
     unsetenv("DS4_METAL_MOE_TILE_MAX");
 

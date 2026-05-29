@@ -6675,13 +6675,33 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
-        if (endp != env) {
-            if (v <= 0) return cap;
-            cap = (uint32_t)v;
-        }
+        if (endp != env && v > 0) cap = (uint32_t)v;
+        /* v <= 0 / unparseable: keep cap = prompt_len */
     } else if (prompt_len > 4096) {
         cap = 4096u;
     }
+
+#ifndef DS4_NO_GPU
+    /* PHASE 3 (CUDA 6 GB floor): the 38 batch activation buffers are sized
+       proportional to this cap. At pc=4096 they are 3.885 GiB and OOM alongside
+       the slotbank slab. Clamp DOWN to a cap that fits free VRAM minus the lazy
+       slotbank+ring+headroom. This is a RESIDENCY decision, not a semantic one:
+       chunked vs whole-batch produce the same logits (KV-accumulation boundary).
+       The clamp overrides DS4_METAL_PREFILL_CHUNK on this backend so the golden
+       gate (which forces 4096) still fits. ds4_gpu_* return 0 off-CUDA -> no-op. */
+    const uint64_t free_b = ds4_gpu_free_vram_bytes();
+    if (free_b > 0) {
+        const uint64_t reserve = ds4_gpu_planned_reserve_bytes();
+        const uint64_t avail = (free_b > reserve) ? (free_b - reserve) : 0;
+        /* Per-token activation cost at pc=1 is ~ (3.885 GiB / 4096) ~= 0.948 MiB.
+           Use a conservative 1.5 MiB/token to absorb KV + indexer growth. */
+        const uint64_t per_tok = 1572864ull;   /* 1.5 MiB */
+        uint32_t vram_cap = (uint32_t)(avail / per_tok);
+        if (vram_cap < 64) vram_cap = 64;       /* floor: always make some progress */
+        if (vram_cap > 4096) vram_cap = 4096;
+        if (cap > vram_cap) cap = vram_cap;
+    }
+#endif
 
     if (cap == 0) cap = 1;
     if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
