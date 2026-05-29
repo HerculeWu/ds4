@@ -27,7 +27,15 @@ int main(void) {
     CHECK(bbr_registry_contains(&reg, 5090, 50) == 0);
     /* miss: off before the first span start */
     CHECK(bbr_registry_contains(&reg, 999, 1) == 0);
+    /* max-bytes: largest span (used to size the slotbank reserve so the
+       output-head transient always fits) */
+    CHECK(bbr_registry_max_bytes(&reg) == 200);   /* [1000,1200) is biggest */
+    bbr_registry_add(&reg, 20000, 4096);
+    CHECK(bbr_registry_max_bytes(&reg) == 4096);   /* picks up the new largest */
     bbr_registry_free(&reg);
+    { bbr_registry empty; bbr_registry_init(&empty, 2);
+      CHECK(bbr_registry_max_bytes(&empty) == 0);   /* empty -> 0 */
+      bbr_registry_free(&empty); }
 
     /* --- ring: reset / acquire hit / miss-fits / doesn't-fit / table-full --- */
     bbr_ring_state ring;

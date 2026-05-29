@@ -55,6 +55,16 @@ static inline void bbr_registry_sort(bbr_registry *r) {
     if (r->n > 1) qsort(r->spans, r->n, sizeof(bbr_span), bbr_span_cmp);
     r->sorted = 1;
 }
+/* Largest single registered span, in bytes (0 if empty). The output head is
+   the biggest backbone tensor, so this is the size of the worst-case transient
+   the resolver must cudaMalloc when a weight is too big for the ring. Callers
+   use it to size memory reserves that must leave room for that transient. */
+static inline uint64_t bbr_registry_max_bytes(const bbr_registry *r) {
+    uint64_t mx = 0;
+    for (uint32_t i = 0; i < r->n; i++) if (r->spans[i].bytes > mx) mx = r->spans[i].bytes;
+    return mx;
+}
+
 /* 1 if [off, off+bytes) is fully contained in a single registered span. */
 static inline int bbr_registry_contains(const bbr_registry *r, uint64_t off, uint64_t bytes) {
     if (r->n == 0 || !r->sorted) return 0;

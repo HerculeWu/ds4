@@ -1167,7 +1167,21 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
         fprintf(stderr, "ds4: FATAL slotbank cudaMemGetInfo: %s\n", cudaGetErrorString(me));
         (void)cudaGetLastError(); return 0;
     }
-    uint64_t reserve = 512ull * 1048576ull;   /* activation scratch + driver headroom */
+    /* The slotbank is greedy: it claims (free - reserve) for the expert pool.
+       Whatever stays inside `reserve` must still hold the largest backbone
+       transient the ring can't absorb -- on this model that is the output head
+       (~536 MiB), allocated at the final logit step long after the slotbank is
+       full. A flat 512 MiB reserve is SMALLER than that transient, so plain
+       generation OOMs at the head (the gate only survived by slab-quantization
+       luck). Size the reserve from the registry's largest span + scratch/driver
+       margin so the head always fits without env tuning. The ring is already
+       allocated before slotbank init (layer-0 attention resolves first), so it
+       is excluded from `free` and need not be re-counted here. */
+    const uint64_t reserve_scratch = 256ull * 1048576ull;  /* cuBLAS workspace + driver + frag */
+    uint64_t max_transient = g_bb_registry_inited
+        ? bbr_registry_max_bytes(&g_bb_registry) : 0;
+    uint64_t reserve = max_transient + reserve_scratch;
+    if (reserve < 512ull * 1048576ull) reserve = 512ull * 1048576ull;  /* never below old floor */
     const char *rsv = getenv("DS4_CUDA_SLOTBANK_RESERVE_MB");
     if (rsv && rsv[0]) { char *e=NULL; unsigned long long v=strtoull(rsv,&e,10); if (e!=rsv) reserve=v*1048576ull; }
     uint64_t usable = (free_b > reserve) ? ((uint64_t)free_b - reserve) : 0;
