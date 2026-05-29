@@ -125,6 +125,10 @@ cuda-slotbank-test: tests/cuda_slotbank_test.c ds4_slotbank_core.h
 	$(CC) -O2 -Wall -Wextra -o cuda_slotbank_test tests/cuda_slotbank_test.c
 	./cuda_slotbank_test
 
+cuda-backbone-ring-test: tests/cuda_backbone_ring_test.c ds4_backbone_ring_core.h
+	$(CC) -O2 -Wall -Wextra -o cuda_backbone_ring_test tests/cuda_backbone_ring_test.c
+	./cuda_backbone_ring_test
+
 ds4.o: ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
