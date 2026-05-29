@@ -67,6 +67,7 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_iq2_tables_cuda.inc"
+#include "ds4_slotbank_core.h"
 
 static const void *g_model_host_base;
 static const char *g_model_device_base;
@@ -131,6 +132,22 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
+/* Phase 2 routed-expert residency cache. The bookkeeping (LRU + open hash) lives
+   in ds4_slotbank_core.h; these globals hold the device slab and slot geometry.
+   A single cudaMalloc'd slab is carved into n_slots equal slots, each packing one
+   expert's gate|up|down contiguously and byte-identical to the source GGUF block
+   so the kernels' intra-expert row stride is unchanged. Defined here but not yet
+   wired into routed_moe_launch (that is Task 6). */
+static cuda_slotbank g_slotbank;
+static char    *g_slotbank_base;       /* single cudaMalloc'd slab */
+static uint64_t g_slot_bytes;          /* per-slot size (gate+up+down, 256-aligned) */
+static uint64_t g_slot_gate_off;       /* intra-slot byte offsets */
+static uint64_t g_slot_up_off;
+static uint64_t g_slot_down_off;
+static uint64_t g_slot_gate_bytes;     /* per-expert component sizes (== source GGUF) */
+static uint64_t g_slot_up_bytes;
+static uint64_t g_slot_down_bytes;
+static int      g_slotbank_ready;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -1117,6 +1134,241 @@ static const char *cuda_model_range_ptr_from_fd(
     return (const char *)dev;
 }
 
+/* One cudaMalloc of the whole slab, carved into n_slots equal slots. Each slot
+   packs one expert's gate|up|down contiguously; each component is byte-identical
+   to its source GGUF expert block so the kernels' intra-expert row stride is
+   unchanged. n_slots is clamped to real free VRAM (NOT the UINT64_MAX env
+   default). Asserts the slab fits before allocating. Fails loudly; never
+   silently degrades, never falls back to host. */
+static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
+                              uint32_t min_slots) {
+    if (g_slotbank_ready) return 1;
+    const uint64_t A = 256u;
+    uint64_t go  = 0;
+    uint64_t uo  = (go  + gate_b + A - 1) & ~(A - 1);
+    uint64_t dno = (uo  + up_b   + A - 1) & ~(A - 1);
+    uint64_t slot = (dno + down_b + A - 1) & ~(A - 1);
+
+    /* Clamp the routed slab to actual free VRAM minus a reserve, never the
+       UINT64_MAX env default. The env limit (if set) is an upper bound only. */
+    size_t free_b = 0, total_b = 0;
+    cudaError_t me = cudaMemGetInfo(&free_b, &total_b);
+    if (me != cudaSuccess) {
+        fprintf(stderr, "ds4: FATAL slotbank cudaMemGetInfo: %s\n", cudaGetErrorString(me));
+        (void)cudaGetLastError(); return 0;
+    }
+    uint64_t reserve = 512ull * 1048576ull;   /* activation scratch + driver headroom */
+    const char *rsv = getenv("DS4_CUDA_SLOTBANK_RESERVE_MB");
+    if (rsv && rsv[0]) { char *e=NULL; unsigned long long v=strtoull(rsv,&e,10); if (e!=rsv) reserve=v*1048576ull; }
+    uint64_t usable = (free_b > reserve) ? ((uint64_t)free_b - reserve) : 0;
+    uint64_t env_limit = cuda_model_cache_limit_bytes();   /* UINT64_MAX if unset */
+    uint64_t budget = (env_limit < usable) ? env_limit : usable;
+
+    uint32_t n = (uint32_t)(budget / slot);
+    if (n < min_slots) {
+        fprintf(stderr, "ds4: FATAL slotbank free=%.2f GiB usable=%.2f GiB holds %u slots "
+                "< required %u (slot=%.2f MiB); cannot keep a full per-layer union resident\n",
+                (double)free_b/1073741824.0, (double)budget/1073741824.0, n, min_slots,
+                (double)slot/1048576.0);
+        return 0;
+    }
+    uint64_t slab_bytes = (uint64_t)n * slot;
+    if (slab_bytes > usable) {   /* explicit fit assert */
+        fprintf(stderr, "ds4: FATAL slotbank slab %.2f GiB > usable %.2f GiB\n",
+                (double)slab_bytes/1073741824.0, (double)usable/1073741824.0);
+        return 0;
+    }
+    char *base = NULL;
+    cudaError_t e = cudaMalloc(&base, (size_t)slab_bytes);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "ds4: FATAL slotbank cudaMalloc %.2f GiB: %s\n",
+                (double)slab_bytes/1073741824.0, cudaGetErrorString(e));
+        (void)cudaGetLastError(); return 0;
+    }
+    memset(&g_slotbank, 0, sizeof(g_slotbank));
+    g_slotbank.n_slots = n;
+    g_slotbank.slots = (cuda_expert_slot *)calloc(n, sizeof(cuda_expert_slot));
+    uint32_t cap = 1; while (cap < n * 2u) cap <<= 1;
+    g_slotbank.hmask = cap - 1u;
+    g_slotbank.htab = (uint32_t *)malloc(cap * sizeof(uint32_t));
+    for (uint32_t i = 0; i < cap; i++) g_slotbank.htab[i] = SLOT_NIL;
+    g_slotbank.lru_head = g_slotbank.lru_tail = SLOT_NIL;
+    for (uint32_t i = 0; i < n; i++) {
+        g_slotbank.slots[i].layer = SB_FREE_LAYER;
+        g_slotbank.slots[i].lru_prev = g_slotbank.slots[i].lru_next = SLOT_NIL;
+        g_slotbank.slots[i].hnext = SLOT_NIL;
+        g_slotbank.slots[i].gate_dev = base + (uint64_t)i * slot + go;
+        g_slotbank.slots[i].up_dev   = base + (uint64_t)i * slot + uo;
+        g_slotbank.slots[i].down_dev = base + (uint64_t)i * slot + dno;
+        sb_lru_push_head(&g_slotbank, i); /* empties available; tail = first victim */
+    }
+    g_slotbank_base = base; g_slot_bytes = slot;
+    g_slot_gate_off = go; g_slot_up_off = uo; g_slot_down_off = dno;
+    g_slot_gate_bytes = gate_b; g_slot_up_bytes = up_b; g_slot_down_bytes = down_b;
+    g_slotbank_ready = 1;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+        fprintf(stderr, "ds4: CUDA slotbank %u slots * %.2f MiB = %.2f GiB (free was %.2f GiB)\n",
+                n, (double)slot/1048576.0, (double)slab_bytes/1073741824.0,
+                (double)free_b/1073741824.0);
+    return 1;
+}
+
+/* Loads ONE expert component (gate/up/down) from the mmap'd GGUF into dst via
+   the existing 4-slot pinned staging pipeline, chunked at cuda_model_copy_chunk_bytes().
+   Mirrors cuda_model_range_ptr_from_fd's event discipline exactly: wait on the
+   round-robin event only once the pipeline is full (chunk_idx>=4), record after
+   the copy. Does NOT sync -- caller batches one cudaStreamSynchronize. */
+static int cuda_slotbank_one_component(uint64_t off, uint64_t bytes, char *dst) {
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
+    uint64_t done = 0, chunk_idx = 0;
+    while (done < bytes) {
+        const uint64_t n = (bytes - done < chunk) ? (bytes - done) : chunk;
+        const uint64_t bi = chunk_idx % 4u;
+        if (chunk_idx >= 4u) {
+            if (cudaEventSynchronize(g_model_stage_event[bi]) != cudaSuccess) {
+                (void)cudaGetLastError(); return 0;
+            }
+        }
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes, off + done, n, &payload))
+            return 0;
+        if (cudaMemcpyAsync(dst + done, payload, (size_t)n,
+                            cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError(); return 0;
+        }
+        if (cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError(); return 0;
+        }
+        done += n; chunk_idx++;
+    }
+    return 1;
+}
+static int cuda_slotbank_fill(uint32_t s, uint64_t gate_off, uint64_t up_off, uint64_t down_off) {
+    cuda_expert_slot *p = &g_slotbank.slots[s];
+    if (!cuda_slotbank_one_component(gate_off, g_slot_gate_bytes, p->gate_dev)) return 0;
+    if (!cuda_slotbank_one_component(up_off,   g_slot_up_bytes,   p->up_dev))   return 0;
+    if (!cuda_slotbank_one_component(down_off, g_slot_down_bytes, p->down_dev)) return 0;
+    p->resident = 1;
+    return 1;
+}
+
+/* RESERVE phase. ids[] is the FULL n_ids = n_tokens*n_expert selected array
+   (with duplicates). For each distinct (layer,eid) we hit-touch or miss-evict-fill;
+   the hash map coalesces duplicates so each expert is uploaded at most once.
+   out_slot[i] receives the PHYSICAL SLOT INDEX for ids[i] (so the caller can
+   remap every selected[] entry to a dense slot index for the kernels). After
+   filling all misses we issue ONE cudaStreamSynchronize so the slab is fully
+   on-device before the caller launches. Returns 1 on success; on any failure
+   (no evictable slot, fill error) returns 0 and the caller MUST abort the
+   launch and MUST NOT fall back to a host pointer. n_expert here is the
+   ROUTING fan-out used only for the (eid * expert_bytes) source offset; the
+   union size is whatever distinct experts appear in ids[]. */
+static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32_t n_ids,
+        uint64_t gate_layer_off, uint64_t up_layer_off, uint64_t down_layer_off,
+        uint64_t gate_expert_bytes, uint64_t up_expert_bytes, uint64_t down_expert_bytes,
+        uint32_t *out_slot) {
+    for (uint32_t i = 0; i < n_ids; i++) {
+        int32_t raw = ids[i];
+        uint32_t eid = (raw < 0) ? 0u : (uint32_t)raw;   /* kernels clamp negatives to 0 */
+        uint32_t s = sb_lookup(&g_slotbank, layer, eid);
+        if (s != SLOT_NIL) {
+            g_slotbank.hits++;
+            sb_touch(&g_slotbank, s);
+        } else {
+            g_slotbank.misses++;
+            s = sb_acquire(&g_slotbank);
+            if (s == SLOT_NIL) {
+                fprintf(stderr, "ds4: FATAL slotbank has no evictable slot for L%u E%u "
+                        "(pinned=%u/%u); per-layer union exceeds slab capacity\n",
+                        layer, eid, g_slotbank.n_pinned, g_slotbank.n_slots);
+                return 0;
+            }
+            sb_evict(&g_slotbank, s);
+            g_slotbank.slots[s].layer = layer;
+            g_slotbank.slots[s].expert_id = eid;
+            sb_hash_insert(&g_slotbank, s);
+            sb_touch(&g_slotbank, s);
+            uint64_t go  = gate_layer_off + (uint64_t)eid * gate_expert_bytes;
+            uint64_t uo  = up_layer_off   + (uint64_t)eid * up_expert_bytes;
+            uint64_t dno = down_layer_off + (uint64_t)eid * down_expert_bytes;
+            if (!cuda_slotbank_fill(s, go, uo, dno)) {
+                sb_hash_remove(&g_slotbank, s);
+                g_slotbank.slots[s].layer = SB_FREE_LAYER;
+                g_slotbank.slots[s].resident = 0;
+                fprintf(stderr, "ds4: FATAL slotbank fill failed L%u E%u\n", layer, eid);
+                return 0;
+            }
+        }
+        /* Phase 2 invariant: every resident expert's three weight bases MUST be
+           true device pointers inside the slab. Fail loudly; never hand a host
+           pointer to the kernels. */
+        const cuda_expert_slot *rp = &g_slotbank.slots[s];
+        if (!cuda_is_device_ptr(rp->gate_dev) ||
+            !cuda_is_device_ptr(rp->up_dev) ||
+            !cuda_is_device_ptr(rp->down_dev)) {
+            fprintf(stderr, "ds4: FATAL slotbank slot %u for L%u E%u has a non-device "
+                    "weight base\n", s, layer, eid);
+            return 0;
+        }
+        out_slot[i] = s;
+    }
+    cudaError_t e = cudaStreamSynchronize(g_model_upload_stream);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: FATAL slotbank upload sync: %s\n", cudaGetErrorString(e));
+        return 0;
+    }
+    return 1;
+}
+
+static void cuda_slotbank_release_all(void) {
+    if (g_slotbank_base) (void)cudaFree(g_slotbank_base);
+    free(g_slotbank.slots); free(g_slotbank.htab);
+    memset(&g_slotbank, 0, sizeof(g_slotbank));
+    g_slotbank_base = NULL; g_slotbank_ready = 0;
+}
+
+/* Test-only shim (Task 4 budget gate): proves the blocker-2 free-VRAM clamp. The
+   cc-compiled smoke binary has no cuda_runtime.h, so all CUDA probes run here.
+   Returns 0 on PASS, nonzero diagnostic code. Tears the bank down afterward so it
+   leaves no global state for the rest of the (model-free) smoke run. */
+extern "C" int cuda_slotbank_init_test(void) {
+    /* Tiny per-expert geometry (1 MiB each) so the slab is small but the clamp
+       logic, slot carving, and LRU seeding are all exercised. */
+    const uint64_t comp = 1048576ull;        /* 1 MiB per component */
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void)cudaGetLastError(); return 2; }
+
+    /* A min_slots so large no real VRAM holds it must fail loudly (never alloc). */
+    uint64_t huge_min = ((uint64_t)free_b / comp) + 1024ull;
+    if (cuda_slotbank_init(comp, comp, comp, (uint32_t)huge_min) != 0) {
+        cuda_slotbank_release_all(); return 3;   /* infeasible min wrongly succeeded */
+    }
+    if (g_slotbank_ready) { cuda_slotbank_release_all(); return 4; }
+
+    /* Feasible request: 8 slots must fit comfortably; init must succeed. */
+    if (cuda_slotbank_init(comp, comp, comp, 8u) != 1) { (void)cudaGetLastError(); return 5; }
+    if (!g_slotbank_ready)          { cuda_slotbank_release_all(); return 6; }
+    if (g_slotbank.n_slots < 8u)    { cuda_slotbank_release_all(); return 7; }
+    if (!g_slotbank_base)           { cuda_slotbank_release_all(); return 8; }
+
+    /* Blocker-2 core assertion: the chosen slab must never exceed free VRAM. */
+    uint64_t slab = (uint64_t)g_slotbank.n_slots * g_slot_bytes;
+    if (slab > (uint64_t)free_b) { cuda_slotbank_release_all(); return 9; }
+
+    /* Slot pointers must be true device pointers inside the slab, and the LRU
+       tail (first victim) must be a real slot. */
+    if (!cuda_is_device_ptr(g_slotbank.slots[0].gate_dev)) { cuda_slotbank_release_all(); return 10; }
+    if (g_slotbank.lru_tail == SLOT_NIL)                   { cuda_slotbank_release_all(); return 11; }
+    if (sb_acquire(&g_slotbank) == SLOT_NIL)               { cuda_slotbank_release_all(); return 12; }
+
+    cuda_slotbank_release_all();
+    if (g_slotbank_ready || g_slotbank_base) return 13;   /* teardown leak */
+    return 0;
+}
+
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
@@ -1219,6 +1471,7 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    cuda_slotbank_release_all();
     cuda_model_load_progress_reset();
 }
 

@@ -30,6 +30,20 @@ static int check_is_device_ptr(void) {
     return 0;
 }
 
+/* Task 4 budget shim (defined in ds4_cuda.cu): exercises cuda_slotbank_init with
+   a tiny per-expert geometry and asserts the free-VRAM clamp (blocker-2) holds --
+   the chosen slab must never exceed cudaMemGetInfo's free bytes, n_slots must be
+   >= the requested min, and a min larger than free VRAM must fail loudly. The
+   cc-compiled, cuda_runtime.h-free test calls this shim which runs all the CUDA
+   probes internally. Returns 0 on PASS. */
+extern int cuda_slotbank_init_test(void);
+static int check_slotbank_init(void) {
+    int rc = cuda_slotbank_init_test();
+    if (rc != 0) { fprintf(stderr, "slotbank_init: FAIL (rc=%d)\n", rc); return 1; }
+    fprintf(stderr, "slotbank_init: PASS\n");
+    return 0;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -164,6 +178,7 @@ int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     rc |= check_is_device_ptr();
+    rc |= check_slotbank_init();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
