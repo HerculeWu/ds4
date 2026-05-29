@@ -11315,7 +11315,7 @@ static int metal_graph_decode_test(
     bool ok = metal_graph_alloc(&g, weights, layer);
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
+    if (ok) ok = ds4_gpu_embed_token_row_hc_tensor(g.cur_hc,
                                                  model->map,
                                                  model->size,
                                                  weights->token_embd->abs_offset,
@@ -11474,7 +11474,7 @@ static int metal_graph_first_token_full_test(
         embed_token_f16(model, weights, token, plain);
         hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
         ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
+        if (ok) ok = ds4_gpu_embed_token_row_hc_tensor(g.cur_hc,
                                                      model->map,
                                                      model->size,
                                                      weights->token_embd->abs_offset,
@@ -11523,7 +11523,7 @@ static int metal_graph_first_token_full_test(
         free(plain);
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
+        if (ok) ok = ds4_gpu_embed_token_row_hc_tensor(g.cur_hc,
                                                      model->map,
                                                      model->size,
                                                      weights->token_embd->abs_offset,
@@ -11604,7 +11604,7 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
-    bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
+    bool ok = ds4_gpu_embed_token_row_hc_tensor(g->cur_hc,
                                               model->map,
                                               model->size,
                                               weights->token_embd->abs_offset,
@@ -11807,7 +11807,7 @@ static bool metal_graph_upload_prompt_embeddings_hc(
     }
 
     if (tokens && n_tokens >= gpu_min) {
-        return ds4_gpu_embed_tokens_hc_tensor(out_hc,
+        return ds4_gpu_embed_tokens_rows_hc_tensor(out_hc,
                                                 tokens,
                                                 model->map,
                                                 model->size,

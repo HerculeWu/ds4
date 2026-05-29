@@ -66,6 +66,15 @@ void ds4_gpu_backbone_release_transient(void);
 uint64_t ds4_gpu_planned_reserve_bytes(void);
 /* Current free device VRAM in bytes (cudaMemGetInfo). 0 on non-CUDA. */
 uint64_t ds4_gpu_free_vram_bytes(void);
+/* Phase 3 token_embd per-row gather: stream only the active row(s) of the
+   1.059 GiB token_embd tensor into a small device buffer instead of querying
+   the full tensor (which would force a 1.059 GiB transient through the ring). */
+int ds4_gpu_embed_token_row_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token,
+        uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_embed_tokens_rows_hc_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *tokens_t,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab,
+        uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);
 
 /* =========================================================================
  * Embeddings and Indexer Helpers.

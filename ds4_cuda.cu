@@ -5912,6 +5912,99 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
     mask[gid] = v;
 }
 
+/* Phase 3: token_embd (F16 [n_embd, n_vocab]) is a 1.059 GiB tensor; the kernel
+   only needs the active token rows. We stream just those rows into a small
+   device buffer (reused across steps), then run a row-base kernel that indexes
+   from row 0. This avoids a 1.059 GiB ring/transient alloc per embed call. */
+static char    *g_embd_rows_dev = NULL;
+static uint64_t g_embd_rows_cap = 0;
+
+static char *cuda_embd_rows_ensure(uint64_t bytes) {
+    if (bytes <= g_embd_rows_cap && g_embd_rows_dev) return g_embd_rows_dev;
+    if (g_embd_rows_dev) { (void)cudaFree(g_embd_rows_dev); g_embd_rows_dev = NULL; }
+    if (cudaMalloc((void **)&g_embd_rows_dev, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError(); g_embd_rows_dev = NULL; g_embd_rows_cap = 0; return NULL;
+    }
+    g_embd_rows_cap = bytes;
+    return g_embd_rows_dev;
+}
+
+/* Same math as embed_token_hc_kernel but the row pointer is already row 0. */
+__global__ static void embed_row_hc_kernel(float *out, const unsigned short *row,
+                                           uint32_t n_embd, uint32_t n_hc) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n = n_embd * n_hc;
+    if (gid >= n) return;
+    uint32_t e = gid % n_embd;
+    out[gid] = __half2float(((const __half *)row)[e]);
+}
+
+extern "C" int ds4_gpu_embed_token_row_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token,
+        uint32_t n_embd, uint32_t n_hc) {
+    (void)n_vocab;
+    if (!out_hc || !model_map) return 0;
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    const uint64_t row_off = weight_offset + (uint64_t)token * row_bytes;
+    if (row_off > model_size || row_bytes > model_size - row_off) return 0;
+    /* The single row is a SUBSET of the registered token_embd span -> the ring
+       resolver streams just row_bytes. */
+    const char *row = cuda_model_range_ptr(model_map, row_off, row_bytes, "token_embd_row");
+    if (!row) return 0;
+    uint32_t n = n_embd * n_hc;
+    embed_row_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
+        (const unsigned short *)row, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "embed token row launch");
+}
+
+/* Batch: gather n_tokens distinct rows into g_embd_rows_dev, then index by row. */
+__global__ static void embed_rows_hc_kernel(float *out, const int32_t *tokens,
+        const __half *rows, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= total) return;
+    uint32_t e = (uint32_t)(gid % n_embd);
+    uint32_t rest = (uint32_t)(gid / n_embd);
+    uint32_t tk = rest / n_hc;                 /* token index within the batch */
+    out[gid] = __half2float(rows[(uint64_t)tk * n_embd + e]);
+}
+
+extern "C" int ds4_gpu_embed_tokens_rows_hc_tensor(ds4_gpu_tensor *out_hc,
+        const ds4_gpu_tensor *tokens_t, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd,
+        uint32_t n_hc) {
+    (void)n_vocab;
+    if (!out_hc || !tokens_t || !model_map || n_tokens == 0) return 0;
+    const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
+    const uint64_t gather_bytes = (uint64_t)n_tokens * row_bytes;
+    char *rows = cuda_embd_rows_ensure(gather_bytes);
+    if (!rows) return 0;
+    /* Read token ids to host (small: n_tokens int32) to know which rows to stream. */
+    int32_t *ids = (int32_t *)malloc((size_t)n_tokens * sizeof(int32_t));
+    if (!ids) return 0;
+    if (cudaMemcpy(ids, tokens_t->ptr, (size_t)n_tokens * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError(); free(ids); return 0;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const uint64_t row_off = weight_offset + (uint64_t)(uint32_t)ids[i] * row_bytes;
+        if (row_off > model_size || row_bytes > model_size - row_off) { free(ids); return 0; }
+        /* Stream one row from the registered token_embd span (subset -> ring) into
+           the gather buffer slot i. cuda_slotbank_one_component does the upload. */
+        if (!cuda_slotbank_one_component(row_off, row_bytes, rows + (uint64_t)i * row_bytes)) {
+            free(ids); return 0;
+        }
+    }
+    free(ids);
+    if (cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
+        (void)cudaGetLastError(); return 0;
+    }
+    uint64_t total = (uint64_t)n_tokens * n_hc * n_embd;
+    embed_rows_hc_kernel<<<(unsigned)((total + 255) / 256), 256>>>((float *)out_hc->ptr,
+        (const int32_t *)tokens_t->ptr, (const __half *)rows, n_tokens, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "embed tokens rows launch");
+}
+
 extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     (void)n_vocab;
     if (!out_hc || !model_map || weight_offset >= model_size) return 0;
