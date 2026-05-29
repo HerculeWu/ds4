@@ -74,6 +74,41 @@ typedef struct {
 static bbr_registry   g_bb_registry;          /* populated at model open */
 static int            g_bb_registry_inited = 0;
 
+static char           *g_bbring_base = NULL;     /* one cudaMalloc */
+static uint64_t        g_bbring_bytes = 0;
+static bbr_ring_state  g_bbring;                 /* from ds4_backbone_ring_core.h */
+static int             g_bbring_inited = 0;
+static void           *g_bb_transient = NULL;    /* output-head oversized buffer */
+
+static uint64_t cuda_bbring_size_bytes(void) {
+    uint64_t mb = 512;   /* default ring 512 MiB; >= measured worst-layer set (Task 6) */
+    const char *env = getenv("DS4_CUDA_BACKBONE_RING_MB");
+    if (env && env[0]) {
+        char *e = NULL; long v = strtol(env, &e, 10);
+        if (e != env && v >= 64 && v <= 4096) mb = (uint64_t)v;
+    }
+    return mb * 1024ull * 1024ull;
+}
+
+static int cuda_bbring_init(void) {
+    if (g_bbring_inited) return g_bbring_base != NULL;
+    g_bbring_inited = 1;
+    g_bbring_bytes = cuda_bbring_size_bytes();
+    cudaError_t err = cudaMalloc((void **)&g_bbring_base, (size_t)g_bbring_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: backbone ring cudaMalloc(%.0f MiB) failed: %s\n",
+                (double)g_bbring_bytes / 1048576.0, cudaGetErrorString(err));
+        g_bbring_base = NULL;
+        return 0;
+    }
+    bbr_ring_init(&g_bbring, g_bbring_bytes);
+    if (getenv("DS4_CUDA_BBRING_VERBOSE"))
+        fprintf(stderr, "ds4: backbone ring allocated %.0f MiB\n",
+                (double)g_bbring_bytes / 1048576.0);
+    return 1;
+}
+
 static const void *g_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
@@ -1800,6 +1835,22 @@ extern "C" void ds4_gpu_finalize_backbone_offsets(void) {
     if (getenv("DS4_CUDA_BBRING_VERBOSE")) {
         fprintf(stderr, "ds4: backbone registry finalized: %u spans\n", g_bb_registry.n);
     }
+}
+
+extern "C" uint64_t ds4_gpu_free_vram_bytes(void) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    return (uint64_t)free_b;
+}
+
+extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
+    /* Slotbank slab (~1.81 GiB) + ring + a fixed activation/driver headroom.
+       These are allocated lazily AFTER graph alloc, so cudaMemGetInfo at
+       graph-alloc time still counts them as free -> we subtract them here. */
+    const uint64_t slot_bytes = (uint64_t)256 * 7078u * 1024u;   /* 256 slots x 7.078 MiB */
+    const uint64_t ring       = cuda_bbring_size_bytes();
+    const uint64_t headroom   = 768ull * 1024ull * 1024ull;      /* output transient + driver + frag */
+    return slot_bytes + ring + headroom;
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
