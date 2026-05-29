@@ -1269,6 +1269,23 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
     return 1;
 }
 
+/* Marks an already-resident slot non-evictable (Phase-1 resident set / shared
+   expert). Pinned slots are removed from the LRU list so eviction never walks
+   them. Returns 1 if the (layer,expert) was resident and is now pinned. This is
+   the residency-tier hook; Phase 4 prefetch and the resident-set warmup call it
+   once the chosen set is known. Per-launch experts in ensure_union are NOT
+   pinned (they are LRU-touched), so pinning never starves a layer's union. */
+static int cuda_slotbank_pin(uint32_t layer, uint32_t expert_id) {
+    uint32_t s = sb_lookup(&g_slotbank, layer, expert_id);
+    if (s == SLOT_NIL || !g_slotbank.slots[s].resident) return 0;
+    if (!g_slotbank.slots[s].pinned) {
+        sb_lru_unlink(&g_slotbank, s);
+        g_slotbank.slots[s].pinned = 1;
+        g_slotbank.n_pinned++;
+    }
+    return 1;
+}
+
 static void cuda_slotbank_release_all(void) {
     if (g_slotbank_base) (void)cudaFree(g_slotbank_base);
     free(g_slotbank.slots); free(g_slotbank.htab);

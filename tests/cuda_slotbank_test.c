@@ -169,6 +169,17 @@ static int test_acquire_full_returns_nil(void) {
     if (sb_acquire(sb) != SLOT_NIL) { fprintf(stderr,"acquire must fail when full\n"); return 1; }
     fprintf(stderr,"test_acquire_full_returns_nil: PASS\n"); return 0;
 }
+static int test_pin_after_fill(void) {
+    cuda_slotbank *sb = make_bank(3);
+    uint32_t a = sb_acquire(sb); fill_slot(sb, a, 7, 99);
+    sb_lru_unlink(sb, a); sb->slots[a].pinned = 1; sb->n_pinned++;  /* pin A */
+    uint32_t b = sb_acquire(sb); fill_slot(sb, b, 7, 1);
+    uint32_t c = sb_acquire(sb); fill_slot(sb, c, 7, 2);
+    uint32_t v = sb_acquire(sb);  /* must be b or c, never pinned a */
+    if (v == a) { fprintf(stderr,"pinned slot chosen as victim\n"); return 1; }
+    if (sb_lookup(sb,7,99) == SLOT_NIL) { fprintf(stderr,"pinned expert lost\n"); return 1; }
+    fprintf(stderr,"test_pin_after_fill: PASS\n"); return 0;
+}
 int main(void) {
     int rc = 0;
     rc |= test_lookup_hit_miss();
@@ -178,6 +189,7 @@ int main(void) {
     rc |= test_union_dedup_fits();
     rc |= test_union_out_slot_remap();
     rc |= test_acquire_full_returns_nil();
+    rc |= test_pin_after_fill();
     if (rc) fprintf(stderr,"SLOTBANK TESTS FAILED\n");
     else    fprintf(stderr,"ALL SLOTBANK TESTS PASS\n");
     return rc;
