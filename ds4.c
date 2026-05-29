@@ -9960,6 +9960,7 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                n_raw,
         int                     token) {
     ds4_gpu_backbone_layer_begin(il);
+    ds4_gpu_backbone_arm_cache(1);   /* decode path: backbone RAM cache active */
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -11963,6 +11964,7 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     ds4_gpu_backbone_layer_begin(il);
+    ds4_gpu_backbone_arm_cache(0);   /* batch prefill: keep cache off (pristine streaming) */
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;

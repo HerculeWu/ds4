@@ -61,6 +61,10 @@ void ds4_gpu_finalize_backbone_offsets(void);
 void ds4_gpu_backbone_layer_begin(uint32_t layer);
 /* Free the transient output-head device buffer (if any) after the logit step. */
 void ds4_gpu_backbone_release_transient(void);
+/* Phase 4: arm (1) or disarm (0) the backbone host RAM residency cache. The
+   single-token decode path arms it; batch prefill disarms it, so the cache is
+   decode-only (prefill stays on the pristine streaming path). No-op off CUDA. */
+void ds4_gpu_backbone_arm_cache(int on);
 /* Bytes the VRAM-aware prefill cap must subtract: slotbank slab + ring +
    activation headroom. Returns 0 on non-CUDA backends. */
 uint64_t ds4_gpu_planned_reserve_bytes(void);

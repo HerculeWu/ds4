@@ -81,6 +81,85 @@ static bbr_ring_state  g_bbring;                 /* from ds4_backbone_ring_core.
 static int             g_bbring_inited = 0;
 static void           *g_bb_transient = NULL;    /* output-head oversized buffer */
 
+/* Phase 4: backbone host RAM residency cache.
+   The 8.8 GB dense backbone (attn proj, shared expert, norms, router, etc.) is
+   re-read from disk on EVERY token through the per-layer ring -- on this box the
+   model lives on an NTFS SSD opened O_DIRECT, so that re-read dominates decode at
+   ~21 s/token (profiled: attn_output/shared_gate_up/q_path are ~90% of the time;
+   the routed experts are ~25 ms because they are VRAM-resident in the slotbank).
+   Compute per layer is ~1 ms, so there is nothing to hide the transfer behind --
+   the fix is to stop re-reading from disk, not to overlap. We read each backbone
+   span from disk EXACTLY ONCE (the working O_DIRECT staging path fills the ring),
+   copy it back to a pinned host buffer (one D2H), and thereafter serve the
+   per-token H2D upload straight from that host copy. 8.8 GB pinned fits the 31 GB
+   box (experts stay on disk -- they rarely miss). Keyed by the span's absolute
+   offset; the model is loaded once per process under the instance lock, so the
+   cache is process-lifetime and never invalidated. Graceful: if a pin fails or the
+   cap is hit, that span just keeps streaming from disk.
+     DS4_CUDA_BACKBONE_RAM_CACHE=0   disable (pure per-token streaming).
+     DS4_CUDA_BACKBONE_RAM_CACHE_GB  cap total cached bytes (default uncapped). */
+typedef struct { uint64_t off; uint64_t bytes; char *host; } bb_ram_ent;
+static bb_ram_ent  *g_bb_ram = NULL;
+static uint32_t     g_bb_ram_n = 0, g_bb_ram_cap = 0;
+static uint64_t     g_bb_ram_used = 0;
+static int          g_bb_ram_state = -1;      /* -1 unread, 0 off, 1 on */
+static uint64_t     g_bb_ram_limit = 0;       /* 0 = uncapped */
+/* The cache is DECODE-ONLY: armed by the single-token decode path, disarmed by
+   batch prefill. Prefill is one-time and re-reads each span at most once across
+   its chunks, so it gains ~nothing from the cache; more importantly the cache's
+   D2H-into-host fill misbehaves on the multi-chunk 4096-token batch path (it
+   produces zero logits there, while the single-token decode path -- pinning the
+   full 7.2 GiB -- is correct). Scoping the cache to decode both captures the win
+   (decode is the floor: ~4.3x) and keeps prefill byte-identical to the streaming
+   path, so the golden gate is unaffected by this cache. */
+static int          g_bb_cache_armed = 0;
+
+static int bb_ram_on(void) {
+    if (g_bb_ram_state < 0) {
+        const char *e = getenv("DS4_CUDA_BACKBONE_RAM_CACHE");
+        g_bb_ram_state = (e && e[0] == '0') ? 0 : 1;
+        const char *g = getenv("DS4_CUDA_BACKBONE_RAM_CACHE_GB");
+        if (g && g[0]) { char *p = NULL; unsigned long long v = strtoull(g, &p, 10);
+            if (p != g) g_bb_ram_limit = (uint64_t)v * 1073741824ull; }
+    }
+    return g_bb_ram_state == 1;
+}
+/* Cache participates only when enabled AND armed (decode). */
+static int bb_cache_active(void) { return bb_ram_on() && g_bb_cache_armed; }
+/* Host copy for (off,bytes) if cached, else NULL. n is in the low hundreds and
+   this runs once per distinct backbone slice per layer, so linear scan is fine. */
+static char *bb_ram_lookup(uint64_t off, uint64_t bytes) {
+    for (uint32_t i = 0; i < g_bb_ram_n; i++)
+        if (g_bb_ram[i].off == off && g_bb_ram[i].bytes == bytes) return g_bb_ram[i].host;
+    return NULL;
+}
+/* Copy the just-uploaded device bytes back to a pinned host buffer so future
+   tokens skip the disk read. Best-effort: any failure leaves the span uncached
+   (it will simply stream from disk again, still correct). */
+static void bb_ram_insert(uint64_t off, uint64_t bytes, const void *dev_src) {
+    if (bytes == 0) return;
+    if (g_bb_ram_limit && g_bb_ram_used + bytes > g_bb_ram_limit) return;
+    char *h = NULL;
+    if (cudaMallocHost((void **)&h, (size_t)bytes) != cudaSuccess) { (void)cudaGetLastError(); return; }
+    if (cudaMemcpy(h, dev_src, (size_t)bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError(); (void)cudaFreeHost(h); return;
+    }
+    if (g_bb_ram_n == g_bb_ram_cap) {
+        uint32_t nc = g_bb_ram_cap ? g_bb_ram_cap * 2u : 256u;
+        bb_ram_ent *na = (bb_ram_ent *)realloc(g_bb_ram, (size_t)nc * sizeof(bb_ram_ent));
+        if (!na) { (void)cudaFreeHost(h); return; }
+        g_bb_ram = na; g_bb_ram_cap = nc;
+    }
+    g_bb_ram[g_bb_ram_n].off = off;
+    g_bb_ram[g_bb_ram_n].bytes = bytes;
+    g_bb_ram[g_bb_ram_n].host = h;
+    g_bb_ram_n++;
+    g_bb_ram_used += bytes;
+    if (getenv("DS4_CUDA_BBRING_VERBOSE"))
+        fprintf(stderr, "ds4: bb ram cache + %.1f MiB (total %.2f GiB, %u spans)\n",
+                (double)bytes / 1048576.0, (double)g_bb_ram_used / 1073741824.0, g_bb_ram_n);
+}
+
 static uint64_t cuda_bbring_size_bytes(void) {
     uint64_t mb = 512;   /* default ring 512 MiB; >= measured worst-layer set (Task 6) */
     const char *env = getenv("DS4_CUDA_BACKBONE_RING_MB");
@@ -1295,9 +1374,19 @@ static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char 
     if (r == 1) {                            /* hit: already uploaded this epoch */
         return g_bbring_base + ring_off;
     }
-    if (r == 0) {                            /* miss-fits: stream into the ring slot */
+    if (r == 0) {                            /* miss-fits: upload into the ring slot */
         char *dst = g_bbring_base + ring_off;
-        if (!cuda_slotbank_one_component(off, bytes, dst)) return NULL;
+        char *ram = bb_cache_active() ? bb_ram_lookup(off, bytes) : NULL;
+        if (ram) {
+            /* RAM-cache hit: H2D from the resident host copy, no disk read. */
+            if (cudaMemcpyAsync(dst, ram, (size_t)bytes, cudaMemcpyHostToDevice,
+                                g_model_upload_stream) != cudaSuccess) {
+                (void)cudaGetLastError(); return NULL;
+            }
+        } else {
+            /* RAM-cache miss: stream from disk into the ring (O_DIRECT staging). */
+            if (!cuda_slotbank_one_component(off, bytes, dst)) return NULL;
+        }
         if (cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
             (void)cudaGetLastError(); return NULL;
         }
@@ -1306,6 +1395,8 @@ static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char 
                     what ? what : "backbone");
             abort();
         }
+        /* First disk read of this span: capture it to RAM so later tokens skip disk. */
+        if (!ram && bb_cache_active()) bb_ram_insert(off, bytes, dst);
         return dst;
     }
     /* r == -1: oversized for the ring (only the output projection at 0.563 GiB,
@@ -1320,14 +1411,28 @@ static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char 
                 (double)bytes / 1048576.0, what ? what : "backbone");
         return NULL;
     }
-    if (!cuda_slotbank_one_component(off, bytes, (char *)t) ||
-        cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
-        (void)cudaGetLastError(); (void)cudaFree(t); return NULL;
-    }
-    if (!cuda_is_device_ptr(t)) {
-        fprintf(stderr, "ds4: FATAL backbone transient not device ptr for %s\n",
-                what ? what : "backbone");
-        abort();
+    {
+        /* Same RAM-cache policy for the oversized output head (~0.56 GiB/token):
+           H2D from the resident host copy on a hit, else stream from disk once and
+           capture it. The transient device buffer itself is still cudaMalloc'd per
+           use (it does not fit the ring); only the disk read is eliminated. */
+        char *ram = bb_cache_active() ? bb_ram_lookup(off, bytes) : NULL;
+        if (ram) {
+            if (cudaMemcpyAsync(t, ram, (size_t)bytes, cudaMemcpyHostToDevice,
+                                g_model_upload_stream) != cudaSuccess ||
+                cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
+                (void)cudaGetLastError(); (void)cudaFree(t); return NULL;
+            }
+        } else if (!cuda_slotbank_one_component(off, bytes, (char *)t) ||
+                   cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError(); (void)cudaFree(t); return NULL;
+        }
+        if (!cuda_is_device_ptr(t)) {
+            fprintf(stderr, "ds4: FATAL backbone transient not device ptr for %s\n",
+                    what ? what : "backbone");
+            abort();
+        }
+        if (!ram && bb_cache_active()) bb_ram_insert(off, bytes, t);
     }
     g_bb_transient = t;
     if (getenv("DS4_CUDA_BBRING_VERBOSE")) {
@@ -1950,6 +2055,11 @@ extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
     const uint64_t headroom   = 768ull * 1024ull * 1024ull;      /* output transient + driver + frag */
     return slot_bytes + ring + headroom;
 }
+
+/* Arm (decode) or disarm (batch prefill) the backbone host RAM cache. The decode
+   layer loop arms it; the batch prefill loop disarms it, so the cache only ever
+   participates in single-token decode (see g_bb_cache_armed). */
+extern "C" void ds4_gpu_backbone_arm_cache(int on) { g_bb_cache_armed = on ? 1 : 0; }
 
 extern "C" void ds4_gpu_backbone_layer_begin(uint32_t layer) {
     if (g_bbring_inited) {
