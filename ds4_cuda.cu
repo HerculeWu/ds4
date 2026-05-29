@@ -81,7 +81,6 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
-static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
@@ -97,13 +96,6 @@ struct cuda_model_range {
     char *registered_device_base;
     uint64_t registered_bytes;
     int host_registered;
-    int arena_allocated;
-};
-
-struct cuda_model_arena {
-    char *device_ptr;
-    uint64_t bytes;
-    uint64_t used;
 };
 
 struct cuda_q8_f16_range {
@@ -125,7 +117,6 @@ struct cuda_q8_f32_range {
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
-static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
@@ -148,6 +139,8 @@ static uint64_t g_slot_gate_bytes;     /* per-expert component sizes (== source 
 static uint64_t g_slot_up_bytes;
 static uint64_t g_slot_down_bytes;
 static int      g_slotbank_ready;
+static int32_t *g_slot_id_scratch;        /* persistent device buffer: selected[]->slot remap */
+static uint32_t g_slot_id_scratch_cap;    /* capacity in int32 elements */
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -289,7 +282,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
+                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
@@ -333,7 +326,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -979,65 +972,6 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     return gb * 1073741824ull;
 }
 
-static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
-    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
-    if (mb < 256) mb = 256;
-    if (mb > 8192) mb = 8192;
-    uint64_t bytes = mb * 1048576ull;
-    if (bytes < need) {
-        const uint64_t align = 256ull * 1048576ull;
-        bytes = (need + align - 1u) & ~(align - 1u);
-    }
-    return bytes;
-}
-
-static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
-    if (bytes == 0) return NULL;
-    if (g_model_cache_full) return NULL;
-    const uint64_t align = 256u;
-    const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
-
-    for (cuda_model_arena &a : g_model_arenas) {
-        const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
-        if (used <= a.bytes && aligned <= a.bytes - used) {
-            char *ptr = a.device_ptr + used;
-            a.used = used + aligned;
-            return ptr;
-        }
-    }
-
-    const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
-
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
-    void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
-                what ? what : "weights",
-                (double)chunk / 1048576.0,
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        g_model_cache_full = 1;
-        return NULL;
-    }
-    g_model_arenas.push_back({(char *)dev, chunk, aligned});
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        uint64_t arena_bytes = 0;
-        for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
-        fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
-                (double)chunk / 1048576.0,
-                (double)arena_bytes / 1073741824.0);
-    }
-    return (char *)dev;
-}
-
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1053,19 +987,26 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return cuda_model_ptr(model_map, offset);
+        /* Phase 2: never fall back to a host pointer. A non-routed range that
+           cannot be made device-resident is a hard failure (return NULL); the
+           caller already treats NULL as failure. */
+        return NULL;
     }
 
-    char *dev = cuda_model_arena_alloc(bytes, what);
-    if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_ptr(model_map, offset);
+    /* Phase 2: non-routed fd-cached ranges get a dedicated cudaMalloc (the old
+       bump arena is gone). Tracked in g_model_ranges so teardown frees it. */
+    char *dev = NULL;
+    if (cudaMalloc((void **)&dev, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: CUDA fd-cache cudaMalloc %.2f MiB for %s failed\n",
+                (double)bytes / 1048576.0, what ? what : "weights");
+        return NULL;   /* strict-fail: never a host pointer */
     }
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) { (void)cudaFree(dev); return NULL; }
 
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
@@ -1078,6 +1019,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
+                (void)cudaFree(dev);
                 return NULL;
             }
         }
@@ -1088,6 +1030,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
+            (void)cudaFree(dev);
             return NULL;
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
@@ -1098,6 +1041,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+            (void)cudaFree(dev);
             return NULL;
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
@@ -1105,6 +1049,7 @@ static const char *cuda_model_range_ptr_from_fd(
             fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            (void)cudaFree(dev);
             return NULL;
         }
         cuda_model_drop_file_pages(offset + copied, n);
@@ -1118,10 +1063,11 @@ static const char *cuda_model_range_ptr_from_fd(
         fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaGetLastError();
+        (void)cudaFree(dev);
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1328,6 +1274,7 @@ static void cuda_slotbank_release_all(void) {
     free(g_slotbank.slots); free(g_slotbank.htab);
     memset(&g_slotbank, 0, sizeof(g_slotbank));
     g_slotbank_base = NULL; g_slotbank_ready = 0;
+    if (g_slot_id_scratch) { (void)cudaFree(g_slot_id_scratch); g_slot_id_scratch = NULL; g_slot_id_scratch_cap = 0; }
 }
 
 /* Test-only shim (Task 4 budget gate): proves the blocker-2 free-VRAM clamp. The
@@ -1457,17 +1404,17 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_all(void) {
+    /* Phase 2: the discriminator is host_registered (mapped/zero-copy ranges own
+       a cudaHostUnregister) vs everything else (device_ptr owns a cudaFree). Both
+       the cudaHostRegister mapped path and the direct-cudaMalloc fd/copy paths now
+       live in g_model_ranges; the bump arena is gone. */
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
-        } else if (r.device_ptr && !r.arena_allocated) {
+        } else if (r.device_ptr) {
             (void)cudaFree(r.device_ptr);
         }
     }
-    for (const cuda_model_arena &a : g_model_arenas) {
-        if (a.device_ptr) (void)cudaFree(a.device_ptr);
-    }
-    g_model_arenas.clear();
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
@@ -1559,7 +1506,6 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     g_model_direct_align = 1;
     g_model_file_size = 0;
-    g_model_cache_full = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -1719,7 +1665,6 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_registered_size = model_size;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
-    g_model_cache_full = 0;
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
@@ -8758,15 +8703,16 @@ __global__ static void moe_count_sorted_pairs_kernel(
 __global__ static void moe_prefix_sorted_pairs_kernel(
         uint32_t *offsets,
         uint32_t *cursors,
-        const uint32_t *counts) {
+        const uint32_t *counts,
+        uint32_t n_buckets) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
-        for (uint32_t e = 0; e < 256u; e++) {
+        for (uint32_t e = 0; e < n_buckets; e++) {
             offsets[e] = sum;
             cursors[e] = sum;
             sum += counts[e];
         }
-        offsets[256] = sum;
+        offsets[n_buckets] = sum;
     }
 }
 
@@ -8787,14 +8733,15 @@ __global__ static void moe_build_expert_tile_offsets_kernel(
         uint32_t *tile_offsets,
         uint32_t *tile_total,
         const uint32_t *counts,
-        uint32_t block_m) {
+        uint32_t block_m,
+        uint32_t n_buckets) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
-        for (uint32_t e = 0; e < 256u; e++) {
+        for (uint32_t e = 0; e < n_buckets; e++) {
             tile_offsets[e] = sum;
             sum += (counts[e] + block_m - 1u) / block_m;
         }
-        tile_offsets[256] = sum;
+        tile_offsets[n_buckets] = sum;
         *tile_total = sum;
     }
 }
@@ -8804,14 +8751,20 @@ __global__ static void moe_build_expert_tiles_kernel(
         uint32_t *tile_starts,
         const uint32_t *tile_offsets,
         const uint32_t *counts,
-        uint32_t block_m) {
-    uint32_t e = threadIdx.x;
-    if (e >= 256u) return;
-    uint32_t ntiles = (counts[e] + block_m - 1u) / block_m;
-    uint32_t off = tile_offsets[e];
-    for (uint32_t t = 0; t < ntiles; t++) {
-        tile_experts[off + t] = e;
-        tile_starts[off + t] = t * block_m;
+        uint32_t block_m,
+        uint32_t n_buckets) {
+    /* Bucket == physical slot index after the Phase 2 remap; n_buckets == n_slots
+       can exceed 256, so iterate grid-stride over all buckets instead of the old
+       single-block, thread==expert, e<256 launch. */
+    for (uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+         e < n_buckets;
+         e += (uint32_t)((uint64_t)gridDim.x * blockDim.x)) {
+        uint32_t ntiles = (counts[e] + block_m - 1u) / block_m;
+        uint32_t off = tile_offsets[e];
+        for (uint32_t t = 0; t < ntiles; t++) {
+            tile_experts[off + t] = e;
+            tile_starts[off + t] = t * block_m;
+        }
     }
 }
 
@@ -10152,6 +10105,26 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* Rewrite EVERY selected[] entry (n = n_tokens*n_expert) to its physical slot
+   index. The slot index array lives in g_slot_id_scratch (a persistent device
+   buffer grown once, never per-launch). Runs on g_model_upload_stream so it is
+   ordered after the ensure_union fills and before the count/scatter/tile kernels
+   (which run on the default stream after the trailing sync). */
+__global__ static void k_remap_selected_full(int32_t *sel, const int32_t *slots, uint32_t n) {
+    uint32_t i = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) sel[i] = slots[i];
+}
+static int cuda_slot_id_scratch_alloc(uint32_t n) {
+    if (g_slot_id_scratch_cap >= n) return 1;
+    if (g_slot_id_scratch) (void)cudaFree(g_slot_id_scratch);
+    g_slot_id_scratch = NULL; g_slot_id_scratch_cap = 0;
+    if (cudaMalloc(&g_slot_id_scratch, (size_t)n * sizeof(int32_t)) != cudaSuccess) {
+        (void)cudaGetLastError(); return 0;
+    }
+    g_slot_id_scratch_cap = n;
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -10178,7 +10151,8 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t layer_index) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -10203,10 +10177,72 @@ static int routed_moe_launch(
         down_bytes > model_size - down_offset) {
         return 0;
     }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
-    if (!gate_w || !up_w || !down_w) return 0;
+    /* Phase 2 slotbank admission. Read the FULL n_tokens*n_expert selected ids
+       host-side (the instance lock makes this serial-safe), ensure the
+       deduplicated per-layer union is device-resident, then remap EVERY
+       selected[] entry to its physical slot index so the kernels' (expert*stride)
+       weight math AND the counts/offsets/tile bucketing both land on dense slots.
+       No host pointer ever escapes to a kernel. */
+    {
+        if (!g_slotbank_ready) {
+            /* min_slots holds a full per-layer union (up to all routed experts) so
+               the all-union-resident-before-launch invariant is always satisfiable.
+               Slot geometry uses the real per-expert gate/up/down byte sizes; the
+               kernels index up with gate_expert_bytes, so gate and up share a size. */
+            uint32_t min_slots = (n_expert > n_total_expert) ? n_expert : n_total_expert;
+            if (!cuda_slotbank_init(gate_expert_bytes, gate_expert_bytes, down_expert_bytes, min_slots))
+                return 0;
+        }
+        const uint32_t n_ids = n_tokens * n_expert;
+        /* The router/topk kernel that wrote selected[] runs on the default stream;
+           this blocking cudaMemcpy on the default stream is ordered after it. */
+        int32_t *sel_host = (int32_t *)malloc((size_t)n_ids * sizeof(int32_t));
+        uint32_t *slot_host = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
+        if (!sel_host || !slot_host) { free(sel_host); free(slot_host);
+            fprintf(stderr, "ds4: FATAL slotbank host scratch alloc\n"); return 0; }
+        if (cudaMemcpy(sel_host, selected->ptr, (size_t)n_ids * sizeof(int32_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            (void)cudaGetLastError(); free(sel_host); free(slot_host);
+            fprintf(stderr, "ds4: FATAL selected D2H\n"); return 0;
+        }
+        if (!cuda_slotbank_ensure_union(layer_index, sel_host, n_ids,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, gate_expert_bytes, down_expert_bytes, slot_host)) {
+            free(sel_host); free(slot_host); return 0;
+        }
+        /* Remap all n_ids entries via the persistent device scratch (no per-launch
+           cudaMalloc/Free). Runs on the upload stream, then we sync so the default-
+           stream count/scatter/tile kernels see the rewritten ids. */
+        int32_t *slot_i32 = sel_host;   /* reuse host buffer as int32 slot ids */
+        for (uint32_t i = 0; i < n_ids; i++) slot_i32[i] = (int32_t)slot_host[i];
+        int ok_remap = cuda_slot_id_scratch_alloc(n_ids);
+        if (ok_remap)
+            ok_remap = (cudaMemcpyAsync(g_slot_id_scratch, slot_i32, (size_t)n_ids * sizeof(int32_t),
+                        cudaMemcpyHostToDevice, g_model_upload_stream) == cudaSuccess);
+        if (ok_remap) {
+            k_remap_selected_full<<<(n_ids + 255u) / 256u, 256, 0, g_model_upload_stream>>>(
+                (int32_t *)selected->ptr, g_slot_id_scratch, n_ids);
+            ok_remap = (cudaGetLastError() == cudaSuccess);
+        }
+        if (ok_remap)
+            ok_remap = (cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess);
+        free(sel_host); free(slot_host);
+        if (!ok_remap) { (void)cudaGetLastError();
+            fprintf(stderr, "ds4: FATAL slotbank selected remap\n"); return 0; }
+    }
+    /* All experts now live in uniform slots: base + slot_index*g_slot_bytes hits the
+       right slot, the intra-slot component offset folded into the base. Override the
+       per-expert stride to the uniform slot stride for gate/up (kernels index up via
+       gate_expert_bytes) and for down. */
+    const char *gate_w = g_slotbank_base + g_slot_gate_off;
+    const char *up_w   = g_slotbank_base + g_slot_up_off;
+    const char *down_w = g_slotbank_base + g_slot_down_off;
+    gate_expert_bytes = g_slot_bytes;   /* up stride == gate stride; kernels read up via gate_expert_bytes */
+    down_expert_bytes = g_slot_bytes;
+    if (!cuda_is_device_ptr(gate_w) || !cuda_is_device_ptr(up_w) || !cuda_is_device_ptr(down_w)) {
+        fprintf(stderr, "ds4: FATAL non-device MoE weight ptr (slotbank)\n");
+        return 0;
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -10287,17 +10323,21 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
-            const uint64_t counts_bytes = 256ull * sizeof(uint32_t);
-            const uint64_t offsets_bytes = 257ull * sizeof(uint32_t);
-            const uint64_t cursors_bytes = 256ull * sizeof(uint32_t);
+            /* Buckets are physical slot indices after the Phase 2 remap, so all
+               count/offset/cursor/tile-offset buffers and the prefix/tile-build
+               kernels are sized to n_slots, not the old hardcoded 256. */
+            const uint64_t n_buckets = (uint64_t)g_slotbank.n_slots;
+            const uint64_t counts_bytes = n_buckets * sizeof(uint32_t);
+            const uint64_t offsets_bytes = (n_buckets + 1ull) * sizeof(uint32_t);
+            const uint64_t cursors_bytes = n_buckets * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
-            tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + 256u;
-            tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + 256u) : 0u;
-            const uint64_t tile_offsets_bytes = 257ull * sizeof(uint32_t);
+            tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + (uint32_t)n_buckets;
+            tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + (uint32_t)n_buckets) : 0u;
+            const uint64_t tile_offsets_bytes = (n_buckets + 1ull) * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
             const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = use_down_tile16 ? 257ull * sizeof(uint32_t) : 0u;
+            const uint64_t tile16_offsets_bytes = use_down_tile16 ? (n_buckets + 1ull) * sizeof(uint32_t) : 0u;
             const uint64_t tile16_total_bytes = use_down_tile16 ? sizeof(uint32_t) : 0u;
             const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
@@ -10338,7 +10378,7 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
                 if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts);
+                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, (uint32_t)n_buckets);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
@@ -10349,20 +10389,21 @@ static int routed_moe_launch(
                         pair_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
+                const uint32_t tile_build_blocks = ((uint32_t)n_buckets + 255u) / 256u;
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m, (uint32_t)n_buckets);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
+                    moe_build_expert_tiles_kernel<<<tile_build_blocks, 256>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m, (uint32_t)n_buckets);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u, (uint32_t)n_buckets);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
+                    moe_build_expert_tiles_kernel<<<tile_build_blocks, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u, (uint32_t)n_buckets);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }
             }
@@ -10709,17 +10750,16 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x) {
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, 1);
+                             selected, weights, n_total_expert, n_expert, clamp, x, 1, layer_index);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    (void)layer_index;
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -10727,7 +10767,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens, layer_index);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

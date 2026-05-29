@@ -98,6 +98,66 @@ static int test_union_dedup_fits(void) {
             fprintf(stderr,"missing union member %d\n", want[i]); return 1; }
     fprintf(stderr,"test_union_dedup_fits: PASS\n"); return 0;
 }
+/* Mirror of cuda_slotbank_ensure_union's out_slot contract: for the FULL
+   n_tokens*n_expert id array (with duplicates) produce a per-id physical slot
+   index. Returns 1 on success. This is the host analog of the device
+   ensure_union + k_remap_selected_full pair: out_slot[i] is what every
+   selected[i] entry is rewritten to before the count/scatter/tile kernels. */
+static int ensure_union_remap(cuda_slotbank *sb, uint32_t layer,
+                              const int32_t *ids, uint32_t n, uint32_t *out_slot) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t eid = (uint32_t)ids[i];
+        uint32_t s = sb_lookup(sb, layer, eid);
+        if (s == SLOT_NIL) {
+            sb->misses++;
+            s = sb_acquire(sb);
+            if (s == SLOT_NIL) return 0;
+            sb_evict(sb, s);
+            fill_slot(sb, s, layer, eid);
+        } else {
+            sb->hits++;
+            sb_touch(sb, s);
+        }
+        out_slot[i] = s;
+    }
+    return 1;
+}
+/* The Task 6 remap contract: rewriting EVERY selected[] entry to its physical
+   slot index must (a) map duplicate expert ids to the SAME slot, (b) keep every
+   slot index in [0,n_slots), and (c) preserve the kernel-visible expert->bucket
+   identity (two entries share a bucket iff they share an expert id). */
+static int test_union_out_slot_remap(void) {
+    cuda_slotbank *sb = make_bank(8);
+    /* 12 entries (2 tokens * 6), distinct union {2,3,7,11}. */
+    int32_t ids[12] = {3,7,3,7,11,3,2,7,11,3,2,7};
+    uint32_t slot[12];
+    if (!ensure_union_remap(sb, 4, ids, 12, slot)) {
+        fprintf(stderr,"remap union must fit in 8 slots\n"); return 1; }
+    for (uint32_t i = 0; i < 12; i++) {
+        if (slot[i] >= sb->n_slots) {
+            fprintf(stderr,"slot %u out of range at i=%u\n", slot[i], i); return 1; }
+        for (uint32_t j = 0; j < 12; j++) {
+            int same_id = (ids[i] == ids[j]);
+            int same_slot = (slot[i] == slot[j]);
+            if (same_id != same_slot) {
+                fprintf(stderr,"remap identity broken: ids[%u]=%d ids[%u]=%d "
+                        "slot[%u]=%u slot[%u]=%u\n",
+                        i, ids[i], j, ids[j], i, slot[i], j, slot[j]);
+                return 1;
+            }
+        }
+    }
+    /* Each distinct slot must point at the right resident expert. */
+    for (uint32_t i = 0; i < 12; i++) {
+        if (sb->slots[slot[i]].layer != 4u ||
+            sb->slots[slot[i]].expert_id != (uint32_t)ids[i] ||
+            !sb->slots[slot[i]].resident) {
+            fprintf(stderr,"slot %u does not hold L4 E%d resident\n", slot[i], ids[i]);
+            return 1;
+        }
+    }
+    fprintf(stderr,"test_union_out_slot_remap: PASS\n"); return 0;
+}
 static int test_acquire_full_returns_nil(void) {
     cuda_slotbank *sb = make_bank(2);
     uint32_t a = sb_acquire(sb); fill_slot(sb, a, 0, 1);
@@ -116,6 +176,7 @@ int main(void) {
     rc |= test_pinned_never_evicted();
     rc |= test_no_key_collision_across_layers();
     rc |= test_union_dedup_fits();
+    rc |= test_union_out_slot_remap();
     rc |= test_acquire_full_returns_nil();
     if (rc) fprintf(stderr,"SLOTBANK TESTS FAILED\n");
     else    fprintf(stderr,"ALL SLOTBANK TESTS PASS\n");
