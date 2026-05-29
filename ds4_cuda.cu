@@ -1316,6 +1316,11 @@ static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char 
         abort();
     }
     g_bb_transient = t;
+    if (getenv("DS4_CUDA_BBRING_VERBOSE")) {
+        size_t fb = 0, tb = 0; (void)cudaMemGetInfo(&fb, &tb); (void)cudaGetLastError();
+        fprintf(stderr, "ds4: backbone transient %.1f MiB ok, free now %.0f MiB\n",
+                (double)bytes / 1048576.0, (double)fb / 1048576.0);
+    }
     return (const char *)t;
 }
 

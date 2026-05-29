@@ -10736,6 +10736,7 @@ static bool metal_graph_encode_output_head(
         const ds4_model       *model,
         const ds4_weights     *weights,
         uint64_t               vocab_dim) {
+    ds4_gpu_backbone_layer_begin(0xFFFFFFFFu);   /* fresh epoch for the logit step */
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
@@ -10789,6 +10790,7 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
     }
+    ds4_gpu_backbone_release_transient();
     return ok;
 }
 
@@ -10808,6 +10810,7 @@ static bool metal_graph_encode_output_head_batch(
         uint64_t               vocab_dim) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
 
+    ds4_gpu_backbone_layer_begin(0xFFFFFFFFu);   /* fresh epoch for the logit step */
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     ds4_gpu_tensor *output_pre = NULL;
     ds4_gpu_tensor *output_weights = NULL;
@@ -10881,6 +10884,7 @@ static bool metal_graph_encode_output_head_batch(
     ds4_gpu_tensor_free(output_embd);
     ds4_gpu_tensor_free(output_weights);
     ds4_gpu_tensor_free(output_pre);
+    ds4_gpu_backbone_release_transient();
     return ok;
 }
 
