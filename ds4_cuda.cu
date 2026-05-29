@@ -5,6 +5,7 @@
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -271,6 +272,9 @@ extern "C" int cuda_is_device_ptr_test(void) {
     return 0;
 }
 
+static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char *what);
+static int cuda_bbring_init(void);
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
@@ -299,6 +303,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             const uintptr_t r1 = r0 + r.registered_bytes;
             if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
         }
+    }
+    /* PHASE 3: backbone offsets are served from the per-layer ring (or a
+       transient for the oversized output head). Returns NULL if not backbone. */
+    {
+        const char *bb = cuda_bbring_resolve(offset, bytes, what);
+        if (bb) return bb;
     }
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
@@ -339,6 +349,20 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
             (void)cudaGetLastError();
         }
+    }
+
+    /* PHASE 3: if the backbone ring is active and this offset is a registered
+       backbone span, it must have been served by cuda_bbring_resolve above (or
+       the fd path). Reaching the unbounded cudaMalloc+cache path for a backbone
+       offset would leak (accumulate 43-layer attention = 4.9 GiB in
+       g_model_ranges) and silently OOM. Fail loudly instead. */
+    if (g_bbring_inited && g_bb_registry_inited &&
+        bbr_registry_contains(&g_bb_registry, offset, bytes)) {
+        fprintf(stderr,
+                "ds4: FATAL backbone offset %" PRIu64 " (%.1f MiB, %s) reached the "
+                "unguarded cudaMalloc fallthrough; ring/fd both failed.\n",
+                offset, (double)bytes / 1048576.0, what ? what : "backbone");
+        return NULL;
     }
 
     void *dev = NULL;
@@ -1240,6 +1264,61 @@ static int cuda_slotbank_fill(uint32_t s, uint64_t gate_off, uint64_t up_off, ui
     return 1;
 }
 
+/* PHASE 3 resolver: serve a backbone weight slice from the per-layer ring.
+   Returns a TRUE device pointer (no host pointer ever), or NULL meaning "not
+   backbone -> caller continues its normal resolution chain". The bytes streamed
+   are byte-identical to what the fd-cache path would stream; only the device
+   buffer's lifetime (epoch-scoped) differs. */
+static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char *what) {
+    if (!g_bb_registry_inited || bytes == 0) return NULL;
+    if (!bbr_registry_contains(&g_bb_registry, off, bytes)) return NULL;  /* not backbone */
+    if (!cuda_bbring_init()) return NULL;   /* ring alloc failed; let caller try fd path */
+
+    const uint64_t aligned = (bytes + 255ull) & ~255ull;
+    uint64_t ring_off = 0;
+    const int r = bbr_ring_acquire(&g_bbring, off, aligned, &ring_off);
+
+    if (r == 1) {                            /* hit: already uploaded this epoch */
+        return g_bbring_base + ring_off;
+    }
+    if (r == 0) {                            /* miss-fits: stream into the ring slot */
+        char *dst = g_bbring_base + ring_off;
+        if (!cuda_slotbank_one_component(off, bytes, dst)) return NULL;
+        if (cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError(); return NULL;
+        }
+        if (!cuda_is_device_ptr(dst)) {
+            fprintf(stderr, "ds4: FATAL backbone ring slot not device ptr for %s\n",
+                    what ? what : "backbone");
+            abort();
+        }
+        return dst;
+    }
+    /* r == -1: oversized for the ring (only the output projection at 0.563 GiB,
+       or a dedup-table-full case). Use a transient cudaMalloc the caller frees
+       via ds4_gpu_backbone_release_transient(). Only ONE transient lives at a
+       time (the output head step); reuse/free defensively. */
+    if (g_bb_transient) { (void)cudaFree(g_bb_transient); g_bb_transient = NULL; }
+    void *t = NULL;
+    if (cudaMalloc(&t, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: backbone transient cudaMalloc(%.1f MiB) failed for %s\n",
+                (double)bytes / 1048576.0, what ? what : "backbone");
+        return NULL;
+    }
+    if (!cuda_slotbank_one_component(off, bytes, (char *)t) ||
+        cudaStreamSynchronize(g_model_upload_stream) != cudaSuccess) {
+        (void)cudaGetLastError(); (void)cudaFree(t); return NULL;
+    }
+    if (!cuda_is_device_ptr(t)) {
+        fprintf(stderr, "ds4: FATAL backbone transient not device ptr for %s\n",
+                what ? what : "backbone");
+        abort();
+    }
+    g_bb_transient = t;
+    return (const char *)t;
+}
+
 /* RESERVE phase. ids[] is the FULL n_ids = n_tokens*n_expert selected array
    (with duplicates). For each distinct (layer,eid) we hit-touch or miss-evict-fill;
    the hash map coalesces duplicates so each expert is uploaded at most once.
@@ -1851,6 +1930,15 @@ extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
     const uint64_t ring       = cuda_bbring_size_bytes();
     const uint64_t headroom   = 768ull * 1024ull * 1024ull;      /* output transient + driver + frag */
     return slot_bytes + ring + headroom;
+}
+
+extern "C" void ds4_gpu_backbone_layer_begin(uint32_t layer) {
+    (void)layer;
+    if (g_bbring_inited) bbr_ring_reset(&g_bbring);
+}
+
+extern "C" void ds4_gpu_backbone_release_transient(void) {
+    if (g_bb_transient) { (void)cudaFree(g_bb_transient); g_bb_transient = NULL; }
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
