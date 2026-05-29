@@ -63,6 +63,19 @@ int main(void) {
     }
     CHECK(got_full_signal == 1);
 
+    /* --- subset semantics relied on by the resolver: a registered FULL tensor
+           span must contain any in-bounds sub-slice query (used to reject a
+           query that does NOT match; token_embd is handled separately). --- */
+    {
+        bbr_registry e; bbr_registry_init(&e, 2);
+        bbr_registry_add(&e, 1000000, 1059u * 1024u * 1024u); /* ~token_embd span */
+        bbr_registry_sort(&e);
+        CHECK(bbr_registry_contains(&e, 1000000, 8192) == 1);            /* a row-sized slice */
+        CHECK(bbr_registry_contains(&e, 1000000, 1059u*1024u*1024u) == 1); /* full span */
+        CHECK(bbr_registry_contains(&e, 999999, 8192) == 0);             /* before start */
+        bbr_registry_free(&e);
+    }
+
     if (failures) { fprintf(stderr, "cuda_backbone_ring_test: %d FAILURES\n", failures); return 1; }
     printf("cuda_backbone_ring_test: all passed\n");
     return 0;

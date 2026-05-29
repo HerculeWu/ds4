@@ -68,6 +68,11 @@ typedef struct {
 
 #include "ds4_iq2_tables_cuda.inc"
 #include "ds4_slotbank_core.h"
+#include "ds4_backbone_ring_core.h"
+
+/* ---- Phase 3 backbone streaming statics (share the slotbank staging pipeline) ---- */
+static bbr_registry   g_bb_registry;          /* populated at model open */
+static int            g_bb_registry_inited = 0;
 
 static const void *g_model_host_base;
 static const char *g_model_device_base;
@@ -1776,6 +1781,25 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 #endif
     }
     return 1;
+}
+
+extern "C" void ds4_gpu_register_backbone_offset(uint64_t offset, uint64_t bytes) {
+    if (!g_bb_registry_inited) {
+        bbr_registry_init(&g_bb_registry, 1024);
+        g_bb_registry_inited = 1;
+    }
+    bbr_registry_add(&g_bb_registry, offset, bytes);
+}
+
+extern "C" void ds4_gpu_finalize_backbone_offsets(void) {
+    if (!g_bb_registry_inited) {
+        bbr_registry_init(&g_bb_registry, 16);
+        g_bb_registry_inited = 1;
+    }
+    bbr_registry_sort(&g_bb_registry);
+    if (getenv("DS4_CUDA_BBRING_VERBOSE")) {
+        fprintf(stderr, "ds4: backbone registry finalized: %u spans\n", g_bb_registry.n);
+    }
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {

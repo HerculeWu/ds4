@@ -49,6 +49,25 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
+ * Phase 3 backbone streaming tier (CUDA only; no-ops elsewhere).
+ * ========================================================================= */
+/* Record one backbone tensor's (abs_offset,bytes) so the streaming resolver can
+   positively identify backbone offsets. Call once per non-routed tensor at open. */
+void ds4_gpu_register_backbone_offset(uint64_t offset, uint64_t bytes);
+/* Sort the registry; call exactly once after all offsets are registered. */
+void ds4_gpu_finalize_backbone_offsets(void);
+/* Reset the per-layer ring epoch (logically frees all ring bytes). Call at the
+   top of each layer's kernel sequence (decode and batch). */
+void ds4_gpu_backbone_layer_begin(uint32_t layer);
+/* Free the transient output-head device buffer (if any) after the logit step. */
+void ds4_gpu_backbone_release_transient(void);
+/* Bytes the VRAM-aware prefill cap must subtract: slotbank slab + ring +
+   activation headroom. Returns 0 on non-CUDA backends. */
+uint64_t ds4_gpu_planned_reserve_bytes(void);
+/* Current free device VRAM in bytes (cudaMemGetInfo). 0 on non-CUDA. */
+uint64_t ds4_gpu_free_vram_bytes(void);
+
+/* =========================================================================
  * Embeddings and Indexer Helpers.
  * =========================================================================
  *
