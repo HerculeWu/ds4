@@ -1597,6 +1597,72 @@ static void model_summary(const ds4_model *m) {
 
 }
 
+/* Bounded substring test for ds4_str (which is NOT null-terminated, so the
+ * libc str* family cannot be used on t->name). */
+static bool ds4_str_contains(ds4_str s, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return true;
+    if (s.len < nl) return false;
+    for (size_t i = 0; i + nl <= s.len; i++)
+        if (memcmp(s.ptr + i, needle, nl) == 0) return true;
+    return false;
+}
+
+/* Diagnostic: print measured per-class byte budget from the loaded GGUF tensor
+ * table.  Reconciles the spec estimates and the on-disk size.  Read-only; uses
+ * the already-computed t->bytes (parse_tensors via tensor_nbytes).
+ *
+ * Classification is FIRST-MATCH, so the table is ordered most-specific first.
+ * Hazards handled here:
+ *   - the routed-expert tensors (ffn_*_exps) must precede the generic shared/
+ *     attn classes;
+ *   - "_shexp" (shared expert) must precede a bare "attn_"/"ffn_" test;
+ *   - "indexer" precedes "compressor" because "indexer_compressor_*" contains
+ *     both substrings and is intentionally folded into the indexer class;
+ *   - a generic "attn_" also matches "attn_compressor_*", so the explicit
+ *     "compressor" row is placed before "attn_" to keep them separate;
+ *   - "output" also matches "output_norm.weight" (tiny); the output_head row is
+ *     refined with !contains("norm") so it counts only the LM head, and the
+ *     norm falls through to "other". */
+static void model_print_tensor_budget(const ds4_model *model) {
+    struct { const char *name; const char *match; uint64_t bytes; uint64_t count; } cls[] = {
+        {"routed_gate (IQ2_XXS)", ".ffn_gate_exps", 0, 0},
+        {"routed_up   (IQ2_XXS)", ".ffn_up_exps",   0, 0},
+        {"routed_down (Q2_K)",    ".ffn_down_exps", 0, 0},
+        {"shared_expert (Q8_0)",  "_shexp",         0, 0},
+        {"indexer (F16)",         "indexer",        0, 0},
+        {"compressor (F16)",      "compressor",     0, 0},
+        {"attention (Q8_0)",      "attn_",          0, 0},
+        {"token_embd",            "token_embd",     0, 0},
+        {"output_head",           "output",         0, 0},
+        {"other",                 "",               0, 0},
+    };
+    const size_t ncls = sizeof(cls) / sizeof(cls[0]);
+    const size_t i_output = 8; /* row index of "output_head" in cls[] above; update if reordered */
+    uint64_t total = 0;
+
+    for (uint64_t ti = 0; ti < model->n_tensors; ti++) {
+        const ds4_tensor *t = &model->tensors[ti];
+        uint64_t b = t->bytes;
+        total += b;
+        size_t i = 0;
+        for (; i + 1 < ncls; i++) {
+            if (!ds4_str_contains(t->name, cls[i].match)) continue;
+            /* output_head must be the LM head only, not output_norm.weight. */
+            if (i == i_output && ds4_str_contains(t->name, "norm")) continue;
+            break;
+        }
+        cls[i].bytes += b;
+        cls[i].count += 1;
+    }
+
+    fprintf(stderr, "ds4: tensor byte budget (measured)\n");
+    for (size_t i = 0; i < ncls; i++)
+        fprintf(stderr, "  %-22s %8.3f GB  (%llu tensors)\n",
+                cls[i].name, cls[i].bytes / 1e9, (unsigned long long)cls[i].count);
+    fprintf(stderr, "  %-22s %8.3f GB\n", "TOTAL", total / 1e9);
+}
+
 static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     const size_t len = strlen(name);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -5816,6 +5882,43 @@ static void layer_routed_moe_one(
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
  * large temporaries come from the persistent scratch arena. */
+/* Diagnostic: DS4_LOG_ROUTER=<path> writes "<tok> <il> e0 e1 ... e5" per
+ * (token, layer) to <path>.  Token-major reconstruction happens offline (sort
+ * by tok, then il), since prefill runs layer-major.  Pure side-effect: it only
+ * reads selected[] and fprintf-s, never touches selection/probs/weights/control
+ * flow, and is a near-zero-cost early return when DS4_LOG_ROUTER is unset
+ * (g_router_log == NULL).  Does NOT alter expert selection or any output.
+ *
+ * CORRECT ONLY ON THE SEQUENTIAL PATH.  g_router_log_tok is a single global set
+ * per token in the decode loop and in layer_forward_raw_swa_one (per-token
+ * prefill).  The batched prefill paths do NOT update it per token, and the
+ * parallel routed-MoE worker (routed_moe_tokens_worker -> layer_routed_moe_one_
+ * prealloc -> this emit) would both race on the shared FILE* and stamp a stale
+ * tok.  So enable DS4_LOG_ROUTER together with DS4_NO_BATCHED_ATTN=1
+ * DS4_NO_SHARED_BATCH_FFN=1 DS4_NO_ROUTED_TOKEN_PARALLEL=1 (which forces the
+ * single-threaded per-token branch); misc/phase1/capture_trace.sh sets them. */
+static FILE     *g_router_log = NULL;
+static uint32_t  g_router_log_tok = 0;   /* set per token before the FFN runs */
+static void router_log_open_once(void) {
+    static int tried = 0;
+    if (tried) return;
+    tried = 1;
+    const char *p = getenv("DS4_LOG_ROUTER");
+    if (p && p[0]) {
+        g_router_log = fopen(p, "w"); /* NULL on failure -> stays disabled */
+        if (g_router_log)
+            fprintf(stderr, "ds4: DS4_LOG_ROUTER -> %s (set DS4_NO_BATCHED_ATTN=1 "
+                    "DS4_NO_SHARED_BATCH_FFN=1 DS4_NO_ROUTED_TOKEN_PARALLEL=1 for "
+                    "correct per-token traces; see capture_trace.sh)\n", p);
+    }
+}
+static void router_log_emit(uint32_t il, const int *selected, uint32_t n) {
+    if (!g_router_log) return;
+    fprintf(g_router_log, "%u %u", g_router_log_tok, il);
+    for (uint32_t i = 0; i < n; i++) fprintf(g_router_log, " %d", selected[i]);
+    fputc('\n', g_router_log);
+}
+
 static void layer_routed_moe_one_prealloc(
         float             * out,
         const ds4_model   * model,
@@ -5845,6 +5948,9 @@ static void layer_routed_moe_one_prealloc(
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
     }
 
+    /* Diagnostic side-effect only (DS4_LOG_ROUTER); does not affect selection. */
+    router_log_emit(il, selected, DS4_N_EXPERT_USED);
+
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         layer->ffn_gate_exps,
                                         layer->ffn_up_exps,
@@ -5860,8 +5966,6 @@ static void layer_routed_moe_one_prealloc(
                               (int64_t)down_in_dim);
     }
     matvec_q2_k_experts_accum_prequant(out, model, layer->ffn_down_exps, midq, selected, DS4_N_EXPERT_USED);
-
-    (void)il;
 }
 
 /* Prefill MoE groups token/expert pairs by expert so each active expert's
@@ -7898,6 +8002,7 @@ static void layer_forward_raw_swa_one(
         float                     steering_attn_scale,
         float                     steering_ffn_scale,
         ds4_cpu_decode_scratch  * scratch) {
+    g_router_log_tok = pos; /* diagnostic only; prefill passes pos=t per token */
     const uint32_t n_hc = DS4_N_HC;
     const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
@@ -8072,6 +8177,8 @@ static void forward_token_raw_swa_cpu_decode_scratch(
         float               steering_attn_scale,
         float               steering_ffn_scale,
         ds4_cpu_decode_scratch * scratch) {
+    router_log_open_once();      /* diagnostic only (DS4_LOG_ROUTER) */
+    g_router_log_tok = pos;      /* token index for this decode step */
     float *cur = scratch->cur;
     float *next = scratch->next;
 
@@ -8148,6 +8255,7 @@ static void prefill_layer_major_cpu(
         long v = strtol(batch_env, NULL, 10);
         if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
     }
+    router_log_open_once();      /* diagnostic only (DS4_LOG_ROUTER) */
 
     for (uint64_t t = 0; t < n_tok; t++) {
         embed_token_f16(model, weights, prompt->v[t], plain);
@@ -18116,6 +18224,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
 void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
+}
+
+void ds4_engine_tensor_budget(ds4_engine *e) {
+    model_print_tensor_budget(&e->model);
 }
 
 int ds4_engine_vocab_size(ds4_engine *e) {

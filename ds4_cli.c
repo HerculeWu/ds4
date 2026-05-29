@@ -54,6 +54,7 @@ typedef struct {
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
+    bool tensor_budget;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -160,6 +161,8 @@ static void usage(FILE *fp) {
         "Diagnostics:\n"
         "  --inspect\n"
         "      Load the model and print a summary only.\n"
+        "  --tensor-budget\n"
+        "      Load the model and print the measured per-class GGUF byte budget, then exit.\n"
         "  --dump-tokens\n"
         "      Tokenize -p/--prompt-file exactly as written, then exit without inference.\n"
         "  --dump-logits FILE\n"
@@ -1542,6 +1545,8 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+        } else if (!strcmp(arg, "--tensor-budget")) {
+            c.tensor_budget = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1587,18 +1592,22 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    cfg.engine.inspect_only = cfg.inspect;
+    /* --tensor-budget only needs the loaded GGUF tensor table, not weights or a
+     * graph, so it loads inspect-only just like --inspect. */
+    cfg.engine.inspect_only = cfg.inspect || cfg.tensor_budget;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);
         return 1;
     }
-    if (!cfg.inspect) {
+    if (!cfg.inspect && !cfg.tensor_budget) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     int rc = 0;
-    if (cfg.inspect) {
+    if (cfg.tensor_budget) {
+        ds4_engine_tensor_budget(engine);
+    } else if (cfg.inspect) {
         ds4_engine_summary(engine);
     } else if (cfg.gen.imatrix_output_path) {
         rc = ds4_engine_collect_imatrix(engine,
