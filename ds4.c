@@ -1608,6 +1608,9 @@ static bool ds4_str_contains(ds4_str s, const char *needle) {
     return false;
 }
 
+/* Forward decl: defined below; needed by the Phase 3 startup-cache skip. */
+static bool tensor_is_routed_expert_type(uint32_t type);
+
 /* Diagnostic: print measured per-class byte budget from the loaded GGUF tensor
  * table.  Reconciles the spec estimates and the on-disk size.  Read-only; uses
  * the already-computed t->bytes (parse_tensors via tensor_nbytes).
@@ -1714,10 +1717,20 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             free(spans);
             return false;
         }
-        spans[nspan++] = (accelerator_tensor_span){
-            .off = t->abs_offset,
-            .end = t->abs_offset + t->bytes,
-        };
+        /* PHASE 3 (6 GB floor model): nothing dense is device-resident at
+           startup. Routed experts -> slotbank (lazy, first MoE). All dense
+           backbone -> per-layer streaming ring (lazy, first resolve). We only
+           RECORD each non-routed tensor's (offset,bytes) so the ring resolver
+           can positively identify backbone offsets. We cache NO bytes here, so
+           the span list stays empty and the OOM-at-span-7 is gone. */
+        if (tensor_is_routed_expert_type(t->type) ||
+            ds4_str_contains(t->name, ".ffn_gate_exps") ||
+            ds4_str_contains(t->name, ".ffn_up_exps") ||
+            ds4_str_contains(t->name, ".ffn_down_exps")) {
+            continue;                                  /* slotbank domain */
+        }
+        ds4_gpu_register_backbone_offset(t->abs_offset, t->bytes);
+        continue;                                      /* backbone streamed per-layer */
     }
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
@@ -1765,11 +1778,20 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
     const double t0 = now_sec();
     uint64_t cached = 0;
     if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    ds4_gpu_finalize_backbone_offsets();
     if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
         getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
             const ds4_tensor *t = &m->tensors[i];
             if (t->bytes == 0) continue;
+            /* PHASE 3: never dequant-resident routed experts (slotbank domain)
+               or backbone attention as F16 -- that would double VRAM (attention
+               4.921 -> ~9.8 GiB). This path is dormant unless DS4_CUDA_Q8_F16/F32
+               _PRELOAD is set; the guard keeps it honest if it ever is. */
+            if (tensor_is_routed_expert_type(t->type)) continue;
+            if (ds4_str_contains(t->name, ".ffn_gate_exps") ||
+                ds4_str_contains(t->name, ".ffn_up_exps") ||
+                ds4_str_contains(t->name, ".ffn_down_exps")) continue;
             if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
             char label[128];
             snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
