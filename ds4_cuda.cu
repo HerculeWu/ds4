@@ -1933,8 +1933,17 @@ extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
 }
 
 extern "C" void ds4_gpu_backbone_layer_begin(uint32_t layer) {
-    (void)layer;
-    if (g_bbring_inited) bbr_ring_reset(&g_bbring);
+    if (g_bbring_inited) {
+        if (getenv("DS4_CUDA_BBRING_VERBOSE"))
+            fprintf(stderr, "ds4: bbring layer %u end: used=%.1f MiB hiwater=%.1f MiB "
+                    "hits=%llu miss=%llu nofit=%llu\n",
+                    layer, (double)g_bbring.used / 1048576.0,
+                    (double)g_bbring.hiwater / 1048576.0,
+                    (unsigned long long)g_bbring.hits,
+                    (unsigned long long)g_bbring.miss_fits,
+                    (unsigned long long)g_bbring.no_fits);
+        bbr_ring_reset(&g_bbring);
+    }
 }
 
 extern "C" void ds4_gpu_backbone_release_transient(void) {
