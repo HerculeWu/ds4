@@ -33,7 +33,7 @@ CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression cuda-slotbank-test
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -120,6 +120,10 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
+
+cuda-slotbank-test: tests/cuda_slotbank_test.c ds4_slotbank_core.h
+	$(CC) -O2 -Wall -Wextra -o cuda_slotbank_test tests/cuda_slotbank_test.c
+	./cuda_slotbank_test
 
 ds4.o: ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c

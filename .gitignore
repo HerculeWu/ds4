@@ -16,3 +16,5 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/cuda_slotbank_test
+/tests/cuda_long_context_smoke
