@@ -19,6 +19,17 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
+/* The shim (defined in ds4_cuda.cu) does the cudaMalloc + malloc + both
+   cuda_is_device_ptr probes internally so this cc-compiled, cuda_runtime.h-free
+   test never touches the CUDA runtime. Returns 0 on PASS. */
+extern int cuda_is_device_ptr_test(void);
+static int check_is_device_ptr(void) {
+    int rc = cuda_is_device_ptr_test();
+    if (rc != 0) { fprintf(stderr, "is_device_ptr: FAIL (rc=%d)\n", rc); return 1; }
+    fprintf(stderr, "is_device_ptr: PASS\n");
+    return 0;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -118,6 +129,7 @@ static int check_decode_attention_overflow_path(void) {
                                               n_raw,
                                               0,
                                               comp,
+                                              0, /* comp_kv_f16: comp written as raw floats */
                                               n_comp,
                                               NULL,
                                               0,
@@ -151,6 +163,7 @@ static int check_decode_attention_overflow_path(void) {
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
+    rc |= check_is_device_ptr();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

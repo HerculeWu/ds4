@@ -195,6 +195,32 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+/* Phase 2 invariant guard: returns 1 IFF p is a true cudaMalloc device
+   pointer. Managed/host/registered/zero-copy and any error => 0. We clear the
+   CUDA error so a probe never poisons the next launch (older drivers return
+   cudaErrorInvalidValue on plain host pointers). */
+static int cuda_is_device_ptr(const void *p) {
+    if (!p) return 0;
+    cudaPointerAttributes a;
+    cudaError_t e = cudaPointerGetAttributes(&a, p);
+    if (e != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    return a.type == cudaMemoryTypeDevice;
+}
+/* Test-only shim: cc-compiled smoke binary cannot include cuda_runtime.h, so
+   it calls this and we run both probes here. Returns 0 on PASS, nonzero code. */
+extern "C" int cuda_is_device_ptr_test(void) {
+    void *dev = NULL;
+    if (cudaMalloc(&dev, 4096) != cudaSuccess) { (void)cudaGetLastError(); return 2; }
+    void *host = malloc(4096);
+    int dev_ok  = cuda_is_device_ptr(dev);
+    int host_ok = cuda_is_device_ptr(host);
+    cudaFree(dev);
+    free(host);
+    if (dev_ok != 1)  return 3;   /* device ptr not recognized */
+    if (host_ok != 0) return 4;   /* host ptr wrongly accepted */
+    return 0;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
