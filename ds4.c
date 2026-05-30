@@ -603,21 +603,6 @@ static uint32_t ds4_layer_compress_ratio(uint32_t il) {
     return g_ds4_compress_ratios[il];
 }
 
-static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
-    if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
-
-    switch (DS4_MODEL_VARIANT) {
-    case DS4_VARIANT_FLASH:
-        if (il < 2) return 0;
-        return (il & 1u) == 0 ? 4u : 128u;
-    case DS4_VARIANT_PRO:
-        if (il < 2) return 128u;
-        return (il & 1u) == 0 ? 4u : 128u;
-    default:
-        ds4_die("unsupported DeepSeek4 model variant");
-    }
-}
-
 static void ds4_die_errno(const char *what, const char *path) {
     fprintf(stderr, "ds4: %s '%s': %s\n", what, path, strerror(errno));
     exit(1);
@@ -2912,13 +2897,11 @@ static void validate_compress_ratio_metadata(const ds4_model *m) {
             got = (uint32_t)v;
         }
 
-        const uint32_t expected = ds4_expected_layer_compress_ratio(il);
-        if (got != expected) {
-            fprintf(stderr,
-                    "ds4: unexpected DeepSeek4 compression ratio at layer %u for %s: got %u, expected %u\n",
-                    il, DS4_MODEL_SHAPE_NAME, got, expected);
-            exit(1);
-        }
+        /* Trust the GGUF array as authoritative: it is the sole hot-path source
+           (ds4_layer_compress_ratio reads g_ds4_compress_ratios). Cross-checking a
+           hardcoded Flash/Pro even-odd pattern would reject otherwise-valid V4
+           layouts; the structural validation above (type/length/non-negative)
+           still rejects malformed metadata. */
         g_ds4_compress_ratios[il] = got;
     }
 }
@@ -6695,7 +6678,9 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
         const uint64_t avail = (free_b > reserve) ? (free_b - reserve) : 0;
         /* Per-token activation cost at pc=1 is ~ (3.885 GiB / 4096) ~= 0.948 MiB.
            Use a conservative 1.5 MiB/token to absorb KV + indexer growth. */
-        const uint64_t per_tok = 1572864ull;   /* 1.5 MiB */
+        /* Per-token activation cost scales with backbone width: Flash (n_embd=4096)
+           -> 1.5 MiB exactly, Pro (7168) -> ~2.6 MiB, keeping the cap VRAM-safe per model. */
+        const uint64_t per_tok = 1572864ull * (uint64_t)DS4_N_EMBD / 4096ull;
         uint32_t vram_cap = (uint32_t)(avail / per_tok);
         if (vram_cap < 64) vram_cap = 64;       /* floor: always make some progress */
         if (vram_cap > 4096) vram_cap = 4096;
@@ -18219,6 +18204,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_quality(e->quality);
+        /* Topology hint for the expert tiers (the CUDA TU can't see DS4_N_* macros):
+           lets the RAM tier auto-grow toward full-pool coverage and the slotbank log
+           the VRAM/RAM elision on bigger hardware. */
+        ds4_gpu_set_model_topology(DS4_N_LAYER, DS4_N_EXPERT);
         (void)ds4_gpu_set_model_fd(e->model.fd);
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,

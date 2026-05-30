@@ -259,6 +259,8 @@ static uint64_t g_slot_gate_bytes;     /* per-expert component sizes (== source 
 static uint64_t g_slot_up_bytes;
 static uint64_t g_slot_down_bytes;
 static int      g_slotbank_ready;
+static uint32_t g_model_n_layer;        /* topology hint (set at model open); 0 = unknown */
+static uint32_t g_model_n_total_expert; /* routed experts per layer; 0 = unknown */
 static int32_t *g_slot_id_scratch;        /* persistent device buffer: selected[]->slot remap */
 static uint32_t g_slot_id_scratch_cap;    /* capacity in int32 elements */
 
@@ -1329,6 +1331,18 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
         fprintf(stderr, "ds4: CUDA slotbank %u slots * %.2f MiB = %.2f GiB (free was %.2f GiB)\n",
                 n, (double)slot/1048576.0, (double)slab_bytes/1073741824.0,
                 (double)free_b/1073741824.0);
+    /* VRAM-elision jump: if the slab holds every expert of every layer, no slot is
+       ever a victim -> the LRU machinery runs but never evicts. One-time signal,
+       unconditional (an important big-VRAM observation); never fires on the 6 GiB
+       baseline (428 slots << full set), so Flash output is unchanged. */
+    if (g_model_n_layer && g_model_n_total_expert) {
+        const uint64_t full_set = (uint64_t)g_model_n_layer * g_model_n_total_expert;
+        if ((uint64_t)n >= full_set)
+            fprintf(stderr, "ds4: CUDA slotbank holds the full model expert set "
+                    "(%u slots >= %llu experts) -- LRU eviction will never fire; "
+                    "experts stay permanently VRAM-resident\n",
+                    n, (unsigned long long)full_set);
+    }
     return 1;
 }
 
@@ -1518,6 +1532,27 @@ static void cuda_expram_init(void) {
     const uint64_t slot = g_slot_bytes;
     uint64_t cap = expram_cap_bytes();
     if (cap == 0 || slot == 0 || cap < slot) { g_expram_ready = -1; return; }
+    /* Disk-tier elision "jump": when the user has NOT pinned a size and the whole
+       routed-expert pool fits in RAM with margin, grow the tier to hold the entire
+       pool. After warmup every expert is RAM-resident -> no expert ever touches disk
+       again. On the 31 GiB baseline the pool (~78 GiB) never fits the margin, so this
+       is a no-op and the conservative memoized default stands (Flash unchanged). The
+       pool < avail-margin < avail-10 invariant keeps it inside expram_cap_bytes's clamp. */
+    {
+        const char *envset = getenv("DS4_CUDA_EXPERT_RAM_CACHE_GB");
+        if (!(envset && envset[0]) && g_model_n_layer && g_model_n_total_expert) {
+            const uint64_t pool   = (uint64_t)g_model_n_layer * g_model_n_total_expert * slot;
+            const uint64_t margin = 16ull * 1073741824ull;   /* backbone(~9G) + OS + activations */
+            const uint64_t avail  = host_mem_available_bytes();
+            if (avail && pool > cap && pool + margin <= avail) {
+                cap = pool;
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+                    fprintf(stderr, "ds4: CUDA expert RAM tier auto-scaled to full pool "
+                            "%.1f GiB (RAM holds all experts -> disk inert after warmup)\n",
+                            (double)pool / 1073741824.0);
+            }
+        }
+    }
     uint32_t n = (uint32_t)(cap / slot);
     char *base = NULL;
     uint64_t slab_bytes = (uint64_t)n * slot;
@@ -2263,7 +2298,13 @@ extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
     /* Slotbank slab (~1.81 GiB) + ring + a fixed activation/driver headroom.
        These are allocated lazily AFTER graph alloc, so cudaMemGetInfo at
        graph-alloc time still counts them as free -> we subtract them here. */
-    const uint64_t slot_bytes = (uint64_t)256 * 7078u * 1024u;   /* 256 slots x 7.078 MiB */
+    /* Scale by the real per-layer expert count; use the live per-slot size once the
+       slotbank exists, else the Flash per-slot estimate (the only thing that differs
+       before init is the expert quant, which g_slot_bytes corrects next prefill).
+       Flash pre-init: 256 * 7078 KiB == the old constant exactly. */
+    const uint64_t n_total    = g_model_n_total_expert ? g_model_n_total_expert : 256u;
+    const uint64_t per_slot   = g_slot_bytes ? g_slot_bytes : (7078ull * 1024ull);
+    const uint64_t slot_bytes = n_total * per_slot;
     const uint64_t ring       = cuda_bbring_size_bytes();
     const uint64_t headroom   = 768ull * 1024ull * 1024ull;      /* output transient + driver + frag */
     return slot_bytes + ring + headroom;
@@ -2333,6 +2374,29 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
+}
+
+extern "C" void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_expert) {
+    g_model_n_layer = n_layer;
+    g_model_n_total_expert = n_total_expert;
+}
+
+/* Loud death for a model/hardware config the specialized CUDA kernels cannot run.
+   These conditions are MODEL properties (fixed for a gguf), so dying on the first
+   token with a named reason is correct: the alternative -- the old `return 0` --
+   propagated as a skipped MoE write -> stale activations -> silently wrong logits.
+   This is the one release path failing loud, NOT a semantic variant (CLAUDE.md). */
+static void cuda_unsupported_fatal(const char *what) {
+    fprintf(stderr,
+            "ds4: FATAL unsupported model/hardware config -- %s\n"
+            "     This CUDA build is specialized to DeepSeek-V4 with IQ2_XXS gate/up + "
+            "Q2_K down experts, n_expert_used=6, expert_weight_scale=1.5, and the "
+            "router kernels assume n_expert=256.\n"
+            "     A different V4 variant (e.g. Pro n_expert=384) or quant mix needs the "
+            "router/MoE kernels extended for that shape; it is rejected here rather than "
+            "run with wrong results.\n", what);
+    fflush(stderr);
+    abort();
 }
 
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
@@ -8486,7 +8550,12 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 }
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) {
+        char m[192];
+        snprintf(m, sizeof m, "router_select n_expert=%u (need 256), n_expert_used=%u (need 6), "
+                 "expert_weight_scale=%.4f (need 1.5)", n_expert, n_expert_used, (double)expert_weight_scale);
+        cuda_unsupported_fatal(m);
+    }
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
@@ -8523,7 +8592,12 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) {
+        char m[192];
+        snprintf(m, sizeof m, "router_select_batch n_expert=%u (need 256), n_expert_used=%u (need 6), "
+                 "expert_weight_scale=%.4f (need 1.5)", n_expert, n_expert_used, (double)expert_weight_scale);
+        cuda_unsupported_fatal(m);
+    }
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
         logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
@@ -10792,8 +10866,20 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    if (!q4k_path && (gate_type != 16u || down_type != 10u)) {
+        char m[192];
+        snprintf(m, sizeof m, "routed MoE expert quant gate_type=%u down_type=%u "
+                 "(supported: IQ2_XXS=16 gate/up + Q2_K=10 down, or Q4_K=12 + Q4_K=12)",
+                 gate_type, down_type);
+        cuda_unsupported_fatal(m);
+    }
+    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) {
+        char m[192];
+        snprintf(m, sizeof m, "Q4_K routed experts run only in decode (n_tokens=1, got %u) "
+                 "with n_expert_used=6 (got %u); no Q4_K prefill/batch kernel exists",
+                 n_tokens, n_expert);
+        cuda_unsupported_fatal(m);
+    }
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||

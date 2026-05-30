@@ -46,6 +46,10 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+/* Model topology hint (n_layer, total routed experts per layer). The CUDA TU
+   cannot see the DS4_N_* shape macros; this lets the expert tiers size the full
+   pool (auto-grow the RAM tier toward full-pool coverage; log VRAM/RAM elision). */
+void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_expert);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
