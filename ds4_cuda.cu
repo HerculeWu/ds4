@@ -261,6 +261,22 @@ static uint64_t g_slot_down_bytes;
 static int      g_slotbank_ready;
 static int32_t *g_slot_id_scratch;        /* persistent device buffer: selected[]->slot remap */
 static uint32_t g_slot_id_scratch_cap;    /* capacity in int32 elements */
+
+/* Phase 5: host-RAM second tier for routed experts -- the SSD->RAM->VRAM "RAM"
+   tier. Structurally identical to the VRAM g_slotbank (same cuda_slotbank, same
+   ds4_slotbank_core.h LRU/hash primitives), but its slots' gate/up/down pointers
+   index one pinned-host slab (cudaHostAlloc) instead of device memory. On a VRAM
+   slot miss during DECODE we consult this tier before disk: a host hit serves the
+   VRAM slot via H2D (~13 GB/s) instead of an O_DIRECT disk read (~0.42 GB/s); a
+   host miss reads disk as before and D2H-captures the bytes so later tokens hit
+   RAM. Decode-only (gated by g_bb_cache_armed) so prefill streams from disk
+   unchanged and the golden gate stays byte-identical. LRU-bounded because the full
+   77.9 GB expert pool cannot fit RAM (unlike the 8.8 GB backbone bb_ram, which is
+   append-only). Kept separate from bb_ram on purpose: different size class,
+   eviction policy, and bb_ram is correctness-critical and must not be perturbed. */
+static cuda_slotbank g_expram;        /* host-backed; *_dev fields point into the pinned host slab */
+static char    *g_expram_base;        /* single cudaHostAlloc'd pinned host slab */
+static int      g_expram_ready;       /* 0 = uninit, 1 = ready, -1 = disabled (alloc failed / 0 cap) */
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -1443,6 +1459,151 @@ static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char 
     return (const char *)t;
 }
 
+/* ---- Phase 5: routed-expert host-RAM tier (g_expram) ----------------------
+   A host-backed mirror of the VRAM slotbank. See the g_expram globals comment. */
+
+/* Linux MemAvailable in bytes (reclaim-aware), 0 if unknown. Used to bound the
+   pinned slab so it never starves the box (bb_ram also pins ~7.2 GiB at decode). */
+static uint64_t host_mem_available_bytes(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return (uint64_t)kb * 1024ull;
+#else
+    return 0;
+#endif
+}
+
+/* Host expert-tier byte cap. DS4_CUDA_EXPERT_RAM_CACHE_GB sets it (GiB); "0"
+   disables the tier; unset uses a conservative 12 GiB default. Always clamped to
+   MemAvailable - 10 GiB so bb_ram (~7.2 GiB) + OS slack stay safe. Read once. */
+static uint64_t expram_cap_bytes(void) {
+    static int state = -1;      /* -1 unread */
+    static uint64_t cap = 0;
+    if (state < 0) {
+        state = 0;
+        const char *e = getenv("DS4_CUDA_EXPERT_RAM_CACHE_GB");
+        if (e && e[0]) {
+            char *p = NULL; unsigned long long v = strtoull(e, &p, 10);
+            if (p != e) cap = (uint64_t)v * 1073741824ull;   /* explicit, incl. 0 = disabled */
+            else fprintf(stderr, "ds4: WARNING DS4_CUDA_EXPERT_RAM_CACHE_GB='%s' is not a "
+                                 "number; expert RAM tier disabled\n", e);
+        } else {
+            cap = 12ull * 1073741824ull;                     /* default 12 GiB */
+        }
+        const uint64_t head = 10ull * 1073741824ull;
+        const uint64_t avail = host_mem_available_bytes();
+        if (avail) {
+            const uint64_t safe = (avail > head) ? (avail - head) : 0;
+            if (cap > safe) cap = safe;
+        }
+    }
+    return cap;
+}
+static int expram_enabled(void) { return expram_cap_bytes() != 0; }
+
+/* Allocate the pinned-host expert slab and seed g_expram's LRU/hash, mirroring
+   cuda_slotbank_init but host-side. Reuses the slot geometry already set by
+   cuda_slotbank_init (g_slot_bytes / g_slot_*_off), so a host slot maps 1:1 onto
+   a VRAM slot's layout. Best-effort: on any failure g_expram_ready = -1 and
+   experts simply stream from disk as before. */
+static void cuda_expram_init(void) {
+    if (g_expram_ready) return;                 /* 1 ready or -1 disabled: done */
+    const uint64_t slot = g_slot_bytes;
+    uint64_t cap = expram_cap_bytes();
+    if (cap == 0 || slot == 0 || cap < slot) { g_expram_ready = -1; return; }
+    uint32_t n = (uint32_t)(cap / slot);
+    char *base = NULL;
+    uint64_t slab_bytes = (uint64_t)n * slot;
+    /* Shrink-on-failure: a too-large default degrades to a smaller tier instead
+       of disabling outright. */
+    while (n >= 1) {
+        slab_bytes = (uint64_t)n * slot;
+        if (cudaHostAlloc((void **)&base, (size_t)slab_bytes, cudaHostAllocDefault) == cudaSuccess) break;
+        (void)cudaGetLastError(); base = NULL;
+        if (n == 1) break;
+        n /= 2u;
+    }
+    if (!base) { g_expram_ready = -1; return; }
+    memset(&g_expram, 0, sizeof(g_expram));
+    g_expram.n_slots = n;
+    g_expram.slots = (cuda_expert_slot *)calloc(n, sizeof(cuda_expert_slot));
+    uint32_t hc = 1; while (hc < n * 2u) hc <<= 1;
+    g_expram.htab = (uint32_t *)malloc((size_t)hc * sizeof(uint32_t));
+    if (!g_expram.slots || !g_expram.htab) {
+        free(g_expram.slots); free(g_expram.htab);
+        (void)cudaFreeHost(base);
+        memset(&g_expram, 0, sizeof(g_expram));
+        g_expram_ready = -1; return;
+    }
+    g_expram.hmask = hc - 1u;
+    for (uint32_t i = 0; i < hc; i++) g_expram.htab[i] = SLOT_NIL;
+    g_expram.lru_head = g_expram.lru_tail = SLOT_NIL;
+    for (uint32_t i = 0; i < n; i++) {
+        g_expram.slots[i].layer = SB_FREE_LAYER;
+        g_expram.slots[i].lru_prev = g_expram.slots[i].lru_next = SLOT_NIL;
+        g_expram.slots[i].hnext = SLOT_NIL;
+        g_expram.slots[i].gate_dev = base + (uint64_t)i * slot + g_slot_gate_off;  /* host ptr */
+        g_expram.slots[i].up_dev   = base + (uint64_t)i * slot + g_slot_up_off;
+        g_expram.slots[i].down_dev = base + (uint64_t)i * slot + g_slot_down_off;
+        sb_lru_push_head(&g_expram, i);
+    }
+    g_expram_base = base;
+    g_expram_ready = 1;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+        fprintf(stderr, "ds4: CUDA expert RAM tier %u slots * %.2f MiB = %.2f GiB (pinned host)\n",
+                n, (double)slot/1048576.0, (double)slab_bytes/1073741824.0);
+}
+
+/* Serve a VRAM slot from the host tier: async H2D of the three components from
+   the pinned host slot into the device slot, on the upload stream (batched into
+   the ensure_union sync). Marks the VRAM slot resident on success. Returns 1/0. */
+static int cuda_expram_serve(uint32_t host_s, uint32_t vram_s) {
+    const cuda_expert_slot *h = &g_expram.slots[host_s];
+    cuda_expert_slot *d = &g_slotbank.slots[vram_s];
+    if (cudaMemcpyAsync(d->gate_dev, h->gate_dev, (size_t)g_slot_gate_bytes,
+                        cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
+        cudaMemcpyAsync(d->up_dev,   h->up_dev,   (size_t)g_slot_up_bytes,
+                        cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
+        cudaMemcpyAsync(d->down_dev, h->down_dev, (size_t)g_slot_down_bytes,
+                        cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    d->resident = 1;
+    return 1;
+}
+
+/* Capture a freshly disk-filled VRAM slot into the host tier so later decode
+   tokens skip the disk read. MUST run AFTER the ensure_union stream sync (the
+   VRAM slot must be stable). Best-effort: on any failure the host slot is left
+   free (evicted, not hash-inserted) and the expert stays disk-only. */
+static void cuda_expram_capture(uint32_t vram_s, uint32_t layer, uint32_t eid) {
+    if (g_expram_ready != 1) return;
+    uint32_t hs = sb_acquire(&g_expram);
+    if (hs == SLOT_NIL) return;                 /* no evictable host slot */
+    sb_evict(&g_expram, hs);                    /* drop old key from hash; marks free */
+    const cuda_expert_slot *d = &g_slotbank.slots[vram_s];
+    cuda_expert_slot *h = &g_expram.slots[hs];
+    if (cudaMemcpy(h->gate_dev, d->gate_dev, (size_t)g_slot_gate_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h->up_dev,   d->up_dev,   (size_t)g_slot_up_bytes,   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h->down_dev, d->down_dev, (size_t)g_slot_down_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;                                 /* hs stays free; not inserted */
+    }
+    h->layer = layer;
+    h->expert_id = eid;
+    h->resident = 1;
+    sb_hash_insert(&g_expram, hs);
+    sb_touch(&g_expram, hs);                     /* now the MRU end */
+}
+
 /* RESERVE phase. ids[] is the FULL n_ids = n_tokens*n_expert selected array
    (with duplicates). For each distinct (layer,eid) we hit-touch or miss-evict-fill;
    the hash map coalesces duplicates so each expert is uploaded at most once.
@@ -1458,6 +1619,23 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
         uint64_t gate_layer_off, uint64_t up_layer_off, uint64_t down_layer_off,
         uint64_t gate_expert_bytes, uint64_t up_expert_bytes, uint64_t down_expert_bytes,
         uint32_t *out_slot) {
+    /* Phase 5: arm the host-RAM expert tier for single-token decode only. The
+       g_bb_cache_armed flag the backbone cache uses already means exactly "in
+       single-token decode" (set/cleared unconditionally at the decode/prefill
+       layer tops), so prefill (armed=0) skips the tier and streams experts from
+       disk, keeping the golden gate byte-identical. cap_slot/cap_eid queue the
+       host-miss slots whose D2H capture must wait until after the batched sync. */
+    int use_expram = 0;
+    uint32_t *cap_slot = NULL, *cap_eid = NULL, cap_n = 0;
+    if (g_bb_cache_armed && expram_enabled()) {
+        cuda_expram_init();                      /* lazy; slot geometry is set by now */
+        if (g_expram_ready == 1) {
+            cap_slot = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
+            cap_eid  = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
+            use_expram = (cap_slot && cap_eid);
+            if (!use_expram) { free(cap_slot); free(cap_eid); cap_slot = cap_eid = NULL; }
+        }
+    }
     for (uint32_t i = 0; i < n_ids; i++) {
         int32_t raw = ids[i];
         uint32_t eid = (raw < 0) ? 0u : (uint32_t)raw;   /* kernels clamp negatives to 0 */
@@ -1472,6 +1650,7 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
                 fprintf(stderr, "ds4: FATAL slotbank has no evictable slot for L%u E%u "
                         "(pinned=%u/%u); per-layer union exceeds slab capacity\n",
                         layer, eid, g_slotbank.n_pinned, g_slotbank.n_slots);
+                free(cap_slot); free(cap_eid);
                 return 0;
             }
             sb_evict(&g_slotbank, s);
@@ -1482,12 +1661,30 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
             uint64_t go  = gate_layer_off + (uint64_t)eid * gate_expert_bytes;
             uint64_t uo  = up_layer_off   + (uint64_t)eid * up_expert_bytes;
             uint64_t dno = down_layer_off + (uint64_t)eid * down_expert_bytes;
-            if (!cuda_slotbank_fill(s, go, uo, dno)) {
+            /* Phase 5: try the host RAM tier before disk (decode only). A host hit
+               serves the VRAM slot over PCIe; a host miss (or a rare serve error)
+               falls back to a disk fill. Only a genuine host miss is queued for
+               D2H capture so a serve-error fallback never duplicates a resident
+               expert in the host tier. */
+            uint32_t hs = use_expram ? sb_lookup(&g_expram, layer, eid) : SLOT_NIL;
+            int served = 0;
+            if (hs != SLOT_NIL) {
+                sb_touch(&g_expram, hs);             /* logical hit: stays MRU even if serve errs */
+                served = cuda_expram_serve(hs, s);
+                if (served) g_expram.hits++;         /* count only a real RAM->VRAM serve */
+            } else if (use_expram) {
+                g_expram.misses++;
+            }
+            if (!served && !cuda_slotbank_fill(s, go, uo, dno)) {
                 sb_hash_remove(&g_slotbank, s);
                 g_slotbank.slots[s].layer = SB_FREE_LAYER;
                 g_slotbank.slots[s].resident = 0;
                 fprintf(stderr, "ds4: FATAL slotbank fill failed L%u E%u\n", layer, eid);
+                free(cap_slot); free(cap_eid);
                 return 0;
+            }
+            if (!served && use_expram && hs == SLOT_NIL) {
+                cap_slot[cap_n] = s; cap_eid[cap_n] = eid; cap_n++;
             }
         }
         /* Phase 2 invariant: every resident expert's three weight bases MUST be
@@ -1499,6 +1696,7 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
             !cuda_is_device_ptr(rp->down_dev)) {
             fprintf(stderr, "ds4: FATAL slotbank slot %u for L%u E%u has a non-device "
                     "weight base\n", s, layer, eid);
+            free(cap_slot); free(cap_eid);
             return 0;
         }
         out_slot[i] = s;
@@ -1507,8 +1705,18 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
     if (e != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr, "ds4: FATAL slotbank upload sync: %s\n", cudaGetErrorString(e));
+        free(cap_slot); free(cap_eid);
         return 0;
     }
+    /* Phase 5: the disk-filled VRAM slots are now stable -- mirror each into the
+       host RAM tier so later decode tokens serve them over PCIe, not disk. */
+    for (uint32_t i = 0; i < cap_n; i++)
+        cuda_expram_capture(cap_slot[i], layer, cap_eid[i]);
+    if (use_expram && getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+        fprintf(stderr, "ds4: expram L%u host hit=%llu miss=%llu | vram hit=%llu miss=%llu\n",
+                layer, (unsigned long long)g_expram.hits, (unsigned long long)g_expram.misses,
+                (unsigned long long)g_slotbank.hits, (unsigned long long)g_slotbank.misses);
+    free(cap_slot); free(cap_eid);
     return 1;
 }
 
@@ -1535,6 +1743,11 @@ static void cuda_slotbank_release_all(void) {
     memset(&g_slotbank, 0, sizeof(g_slotbank));
     g_slotbank_base = NULL; g_slotbank_ready = 0;
     if (g_slot_id_scratch) { (void)cudaFree(g_slot_id_scratch); g_slot_id_scratch = NULL; g_slot_id_scratch_cap = 0; }
+    /* Phase 5 host-RAM expert tier. */
+    if (g_expram_base) (void)cudaFreeHost(g_expram_base);
+    free(g_expram.slots); free(g_expram.htab);
+    memset(&g_expram, 0, sizeof(g_expram));
+    g_expram_base = NULL; g_expram_ready = 0;
 }
 
 /* Test-only shim (Task 4 budget gate): proves the blocker-2 free-VRAM clamp. The
