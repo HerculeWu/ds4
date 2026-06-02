@@ -52,6 +52,17 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_expert);
 void ds4_gpu_print_memory_report(const char *label);
 
+/* Multi-GPU pipeline split (Phase 8). Single node, N CUDA devices: contiguous
+   blocks of decoder layers map to devices; the per-layer decode loop calls
+   ds4_gpu_set_active_device() at each layer boundary so all of that layer's
+   attention/router/MoE compute + KV run on the owning device (NO floating-point
+   accumulation ever crosses a device boundary -- only the inter-layer carry is
+   copied). ds4_gpu_device_count() returns 1 on a single-GPU build, where the layer
+   map is all-zero and these are no-ops -> the single-GPU path is unchanged. */
+int  ds4_gpu_device_count(void);
+int  ds4_gpu_layer_device(uint32_t layer);
+int  ds4_gpu_set_active_device(int dev);
+
 /* Scale-up ("big memory") profile gate. True when compiled with -DDS4_BIGMEM
    (make cuda-bigmem) OR the runtime DS4_BIGMEM env is set to a non-"0" value
    (the env wins either way, so a bigmem binary can be A/B'd with DS4_BIGMEM=0).

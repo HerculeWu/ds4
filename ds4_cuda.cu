@@ -2854,6 +2854,82 @@ extern "C" void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_ex
     g_model_n_total_expert = n_total_expert;
 }
 
+/* ---- Phase 8.2: layer -> device assignment (pipeline split) --------------------
+   Contiguous blocks of decoder layers map to devices, balanced by cumulative
+   per-layer routed-expert bytes (the dominant VRAM term; backbone + KV are roughly
+   uniform per layer). token_embd rides on the first device (owns the embed/layer 0)
+   and the output head on the last device; each adds ~1 GiB to its endpoint, which
+   the Phase-3 fit check accounts for -- the split itself does not perturb for it
+   because the endpoint cost is small next to a ~39 GiB expert shard. With g_ngpu==1
+   every layer maps to device 0 (the boundary set is empty), so the single-GPU path
+   is unchanged. Built once, lazily, after the expert registry is populated. */
+static int8_t g_layer_device[256];
+static int    g_layer_device_built = 0;
+
+static uint64_t cuda_layer_expert_bytes(uint32_t il) {
+    if (il >= 256) return 0;
+    const cuda_expert_layer_off *e = &g_expoff[il];
+    if (e->gate_expert_bytes == 0) return 0;   /* unregistered -> caller uses uniform 1 */
+    /* gate + up (same per-expert stride) + down, times the routed-expert count. */
+    return ((uint64_t)2 * e->gate_expert_bytes + e->down_expert_bytes) *
+           (uint64_t)g_model_n_total_expert;
+}
+
+static void cuda_build_layer_device_map(void) {
+    if (g_layer_device_built) return;
+    const uint32_t n = g_model_n_layer;
+    if (n == 0) return;                          /* topology not set yet -- retry later */
+    for (uint32_t il = 0; il < n && il < 256; il++) g_layer_device[il] = 0;
+    if (g_ngpu > 1) {
+        uint64_t total = 0;
+        for (uint32_t il = 0; il < n; il++) {
+            uint64_t b = cuda_layer_expert_bytes(il);
+            total += (b ? b : 1);
+        }
+        const uint64_t target = total / (uint64_t)g_ngpu;   /* per-device byte goal */
+        uint64_t acc = 0; int dev = 0;
+        for (uint32_t il = 0; il < n && il < 256; il++) {
+            g_layer_device[il] = (int8_t)dev;
+            uint64_t b = cuda_layer_expert_bytes(il); acc += (b ? b : 1);
+            /* Close this device once it reaches its byte goal, but leave at least
+               one layer for each remaining device (contiguous + monotone). */
+            if (dev < g_ngpu - 1 && acc >= target &&
+                (int)(n - il - 1) >= (g_ngpu - dev - 1)) {
+                dev++; acc = 0;
+            }
+        }
+    }
+    g_layer_device_built = 1;
+    if (g_ngpu > 1 || getenv("DS4_CUDA_MULTIGPU_VERBOSE")) {
+        for (int d = 0; d < g_ngpu; d++) {
+            int lo = -1, hi = -1;
+            for (uint32_t il = 0; il < n; il++)
+                if (g_layer_device[il] == d) { if (lo < 0) lo = (int)il; hi = (int)il; }
+            fprintf(stderr, "ds4: multi-GPU layer split: device %d owns layers %d..%d\n", d, lo, hi);
+        }
+    }
+}
+
+/* Owning device of a decoder layer (0 on a 1-GPU build). Lazily builds the map. */
+extern "C" int ds4_gpu_layer_device(uint32_t layer) {
+    if (!g_layer_device_built) cuda_build_layer_device_map();
+    return (layer < 256) ? (int)g_layer_device[layer] : 0;
+}
+
+extern "C" int ds4_gpu_device_count(void) { return g_ngpu; }
+
+/* Switch the active device for the pipeline split: sets BOTH the CUDA current
+   device and g_cur (the per-device tier view), so every g_* tier macro and every
+   subsequent kernel/cublas/alloc targets `dev`. On a 1-GPU build this is only ever
+   called with 0 (a no-op switch). The caller is the per-layer decode loop, which
+   sets the device once at each layer boundary (Phase 3). */
+extern "C" int ds4_gpu_set_active_device(int dev) {
+    if (dev < 0 || dev >= g_ngpu) return 0;
+    if (!cuda_ok(cudaSetDevice(dev), "set active device")) return 0;
+    g_cur = dev;
+    return 1;
+}
+
 /* Loud death for a model/hardware config the specialized CUDA kernels cannot run.
    These conditions are MODEL properties (fixed for a gguf), so dying on the first
    token with a named reason is correct: the alternative -- the old `return 0` --
