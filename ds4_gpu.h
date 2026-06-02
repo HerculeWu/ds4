@@ -71,6 +71,12 @@ int ds4_gpu_bigmem(void);
 void ds4_gpu_register_backbone_offset(uint64_t offset, uint64_t bytes);
 /* Sort the registry; call exactly once after all offsets are registered. */
 void ds4_gpu_finalize_backbone_offsets(void);
+/* Record one routed layer's GGUF expert offsets + per-expert strides (identical to
+   the decode routed-MoE call) so the CUDA host-RAM tier can eager-prefill the whole
+   expert pool at decode start, collapsing the cold-disk warmup ramp to PCIe serves.
+   Call once per layer at model open. CUDA-only; the caller guards the call site. */
+void ds4_gpu_register_expert_layer(uint32_t layer, uint64_t gate_off, uint64_t up_off,
+        uint64_t down_off, uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
 /* Reset the per-layer ring epoch (logically frees all ring bytes). Call at the
    top of each layer's kernel sequence (decode and batch). */
 void ds4_gpu_backbone_layer_begin(uint32_t layer);

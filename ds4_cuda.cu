@@ -319,6 +319,29 @@ static uint32_t g_slot_id_scratch_cap;    /* capacity in int32 elements */
 static cuda_slotbank g_expram;        /* host-backed; *_dev fields point into the pinned host slab */
 static char    *g_expram_base;        /* single cudaHostAlloc'd pinned host slab */
 static int      g_expram_ready;       /* 0 = uninit, 1 = ready, -1 = disabled (alloc failed / 0 cap) */
+
+/* Eager-prefill: stream the WHOLE routed-expert pool disk->host RAM at the start of
+   decode so the warmup ramp (cold per-token disk fills, ~17-19s on the first token
+   alone) collapses to fast PCIe RAM->VRAM serves. Per-layer GGUF offsets/strides are
+   registered at model open (ds4_gpu_register_expert_layer) -- the SAME values the
+   decode routed-MoE call passes -- so the loader reads bytes byte-identical to the
+   lazy disk path. ensure_union validates each registration against the live offsets
+   before serving (cuda_expoff_matches), so a registration drift aborts loudly rather
+   than ever serving a wrong expert. OPT-IN (DS4_CUDA_EXPERT_PREFILL=1, default OFF):
+   measured net-negative below ~4600 decode tokens because it reads the whole pool
+   (~3x the typical working set) up front, so the lazy reactive tier stays the default;
+   eager only wins long / flat-latency sessions. Floor-safe: a pure no-op unless opted
+   in AND the tier is sized to hold the full pool (so no eager entry can ever be
+   evicted). Index g_expoff[] by layer index il. */
+typedef struct {
+    uint64_t gate_off, up_off, down_off;   /* GGUF abs_offset of each layer's expert tensor */
+    uint64_t gate_expert_bytes;            /* per-expert stride (gate AND up share it) */
+    uint64_t down_expert_bytes;            /* per-expert stride for down */
+} cuda_expert_layer_off;
+static cuda_expert_layer_off g_expoff[256];   /* indexed by layer il; gate_expert_bytes==0 => unregistered */
+static uint32_t g_expoff_n = 0;               /* highest registered layer + 1 */
+static int g_expram_prefilled = 0;            /* one-shot: bulk load attempted */
+static int g_expram_prefill_active = 0;       /* 1 once the bulk load actually populated the tier */
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -1772,6 +1795,10 @@ static void cuda_expram_init(void) {
 static int cuda_expram_serve(uint32_t host_s, uint32_t vram_s) {
     const cuda_expert_slot *h = &g_expram.slots[host_s];
     cuda_expert_slot *d = &g_slotbank.slots[vram_s];
+    /* Never serve a slot whose three components are not fully present: a host slot
+       is hash-inserted (and thus lookup-able) only after a complete fill sets
+       resident=1, so this guards against any future partial-fill insertion path. */
+    if (!h->resident) return 0;
     if (cudaMemcpyAsync(d->gate_dev, h->gate_dev, (size_t)g_slot_gate_bytes,
                         cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
         cudaMemcpyAsync(d->up_dev,   h->up_dev,   (size_t)g_slot_up_bytes,
@@ -1809,6 +1836,110 @@ static void cuda_expram_capture(uint32_t vram_s, uint32_t layer, uint32_t eid) {
     sb_touch(&g_expram, hs);                     /* now the MRU end */
 }
 
+/* True iff layer's registered eager-prefill offsets match the live decode offsets.
+   The live offsets (ensure_union args) are the source of truth; this catches any
+   drift between the model-open registration and the routed-MoE call before a single
+   RAM serve. An unregistered layer (gate_expert_bytes==0) is treated as "no match"
+   so eager prefill simply stays off for it. */
+static int cuda_expoff_matches(uint32_t layer, uint64_t gate_off, uint64_t up_off,
+        uint64_t down_off, uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (layer >= 256u) return 0;
+    const cuda_expert_layer_off *e = &g_expoff[layer];
+    return e->gate_expert_bytes != 0 &&
+           e->gate_off == gate_off && e->up_off == up_off && e->down_off == down_off &&
+           e->gate_expert_bytes == gate_expert_bytes && e->down_expert_bytes == down_expert_bytes;
+}
+
+/* Eager-prefill helper: stream ONE expert component (gate/up/down) from the mmap'd
+   GGUF into a pinned-host slot via the same O_DIRECT staging primitive the lazy VRAM
+   fill uses (cuda_model_stage_read). Unlike cuda_slotbank_one_component (which issues
+   async H2D and needs the 4-slot event ring), the copy out of the stage here is a
+   synchronous host->host memcpy, so a single stage buffer is reused serially with no
+   device work and no event discipline. Returns 1 on success. */
+static int cuda_expram_fill_one_component(uint64_t off, uint64_t bytes, char *host_dst) {
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
+    uint64_t done = 0;
+    while (done < bytes) {
+        const uint64_t n = (bytes - done < chunk) ? (bytes - done) : chunk;
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_model_stage[0], g_model_stage_bytes, off + done, n, &payload))
+            return 0;
+        memcpy(host_dst + done, payload, (size_t)n);   /* host->host; stage free on return */
+        done += n;
+    }
+    return 1;
+}
+
+/* One-shot eager prefill of the host-RAM expert tier: stream EVERY routed expert
+   disk->host so the decode warmup ramp collapses to PCIe serves and disk stays inert
+   for the rest of the session. Mirrors cuda_expram_capture's slot bookkeeping exactly
+   (acquire/evict/fill/insert/touch) but fills from disk instead of D2H. Caller (the
+   first armed decode ensure_union) has already validated the current layer's offsets;
+   later layers re-validate at the top of ensure_union before any serve. Floor-safe:
+   returns immediately unless bigmem, the tier is live, and it is sized to the full
+   pool (so no eager entry is ever an eviction victim). */
+static void cuda_expram_prefill_all(void) {
+    if (g_expram_prefilled) return;
+    g_expram_prefilled = 1;                           /* attempt at most once */
+    /* OPT-IN ONLY (default OFF). Measured on A40: eager-loading the whole pool reads
+       ~3x the typical working set and pays it all up front, so it is net-negative
+       below ~4600 decode tokens -- the lazy reactive tier is the better default.
+       Enable (DS4_CUDA_EXPERT_PREFILL=1) for long sessions or when flat latency from
+       token 1 matters more than the one-time full-pool load. The full-pool residency
+       gate below still applies, so on a box where the pool does not fit RAM this is a
+       safe no-op even when opted in. */
+    const char *env = getenv("DS4_CUDA_EXPERT_PREFILL");
+    if (!(env && env[0] == '1')) return;               /* default OFF; =1 to enable */
+    if (g_expram_ready != 1) return;                   /* tier must be live */
+    if (g_slot_bytes == 0 || g_expoff_n == 0 || g_model_n_total_expert == 0) return;
+    /* Full-pool residency gate: only safe when the tier holds every expert, so the
+       LRU never evicts an eager-loaded entry (append-only for the session). When a
+       cudaHostAlloc shrink left the tier smaller, stay lazy and say so. */
+    const uint64_t full_set = (uint64_t)g_expoff_n * g_model_n_total_expert;
+    if ((uint64_t)g_expram.n_slots < full_set) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+            fprintf(stderr, "ds4: CUDA eager expert prefill skipped: tier %u slots < full pool %llu experts\n",
+                    g_expram.n_slots, (unsigned long long)full_set);
+        return;
+    }
+    const double t0 = cuda_wall_sec();
+    fprintf(stderr, "ds4: CUDA eager expert prefill (opt-in): streaming %.1f GiB (%llu experts) "
+            "disk->host RAM, one-time...\n",
+            (double)(full_set * g_slot_bytes) / 1073741824.0, (unsigned long long)full_set);
+    uint64_t loaded = 0, n_exp = 0;
+    for (uint32_t layer = 0; layer < g_expoff_n; layer++) {
+        const cuda_expert_layer_off *e = &g_expoff[layer];
+        if (e->gate_expert_bytes == 0) continue;       /* unregistered layer */
+        for (uint32_t eid = 0; eid < g_model_n_total_expert; eid++) {
+            if (sb_lookup(&g_expram, layer, eid) != SLOT_NIL) continue;  /* already resident */
+            uint32_t hs = sb_acquire(&g_expram);
+            if (hs == SLOT_NIL) goto done;             /* unreachable under the full_set gate */
+            sb_evict(&g_expram, hs);
+            cuda_expert_slot *h = &g_expram.slots[hs];
+            const uint64_t go  = e->gate_off + (uint64_t)eid * e->gate_expert_bytes;
+            const uint64_t uo  = e->up_off   + (uint64_t)eid * e->gate_expert_bytes;  /* up stride == gate */
+            const uint64_t dno = e->down_off + (uint64_t)eid * e->down_expert_bytes;
+            if (!cuda_expram_fill_one_component(go,  g_slot_gate_bytes, h->gate_dev) ||
+                !cuda_expram_fill_one_component(uo,  g_slot_up_bytes,   h->up_dev)   ||
+                !cuda_expram_fill_one_component(dno, g_slot_down_bytes, h->down_dev)) {
+                /* best-effort: leave the slot free (non-resident) so the lazy disk
+                   path still serves this expert; never insert a partial slot. */
+                continue;
+            }
+            h->layer = layer; h->expert_id = eid; h->resident = 1;
+            sb_hash_insert(&g_expram, hs);
+            sb_touch(&g_expram, hs);
+            loaded += g_slot_bytes; n_exp++;
+        }
+    }
+done:
+    g_expram_prefill_active = (n_exp > 0) ? 1 : 0;    /* arm the per-layer serve guard */
+    fprintf(stderr, "ds4: CUDA eager expert prefill loaded %.2f GiB (%llu experts) disk->host RAM in %.1fs\n",
+            (double)loaded / 1073741824.0, (unsigned long long)n_exp, cuda_wall_sec() - t0);
+}
+
 /* RESERVE phase. ids[] is the FULL n_ids = n_tokens*n_expert selected array
    (with duplicates). For each distinct (layer,eid) we hit-touch or miss-evict-fill;
    the hash map coalesces duplicates so each expert is uploaded at most once.
@@ -1830,11 +1961,35 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
        layer tops), so prefill (armed=0) skips the tier and streams experts from
        disk, keeping the golden gate byte-identical. cap_slot/cap_eid queue the
        host-miss slots whose D2H capture must wait until after the batched sync. */
+    /* Eager-prefill serve guard: once the bulk loader has populated the host tier
+       from the model-open registration, every layer must prove its registered
+       offsets still match the live decode offsets BEFORE any RAM serve. A mismatch
+       means the registration drifted from the routed-MoE call -> abort rather than
+       ever serve a wrong expert. Runs before the serve loop below, so bad bytes
+       (even if eager-loaded) can never reach the kernels. */
+    if (g_expram_prefill_active &&
+        !cuda_expoff_matches(layer, gate_layer_off, up_layer_off, down_layer_off,
+                             gate_expert_bytes, down_expert_bytes)) {
+        fprintf(stderr, "ds4: FATAL eager-prefill offset mismatch L%u; aborting before serve\n", layer);
+        return 0;
+    }
     int use_expram = 0;
     uint32_t *cap_slot = NULL, *cap_eid = NULL, cap_n = 0;
     if (g_bb_cache_armed && expram_enabled()) {
         cuda_expram_init();                      /* lazy; slot geometry is set by now */
         if (g_expram_ready == 1) {
+            /* One-shot eager prefill on the first armed decode call. Validate THIS
+               layer's registered offsets against the live ones first; the bulk load
+               then trusts the uniform per-layer math and every later layer is
+               re-validated by the serve guard above. A failed match (or unregistered
+               layer) just leaves the tier lazy. No-op unless bigmem + full pool. */
+            if (!g_expram_prefilled) {
+                if (cuda_expoff_matches(layer, gate_layer_off, up_layer_off, down_layer_off,
+                                        gate_expert_bytes, down_expert_bytes))
+                    cuda_expram_prefill_all();
+                else
+                    g_expram_prefilled = 1;      /* unregistered/mismatched first layer: stay lazy */
+            }
             cap_slot = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
             cap_eid  = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
             use_expram = (cap_slot && cap_eid);
@@ -2450,6 +2605,24 @@ extern "C" void ds4_gpu_register_backbone_offset(uint64_t offset, uint64_t bytes
         g_bb_registry_inited = 1;
     }
     bbr_registry_add(&g_bb_registry, offset, bytes);
+}
+
+/* Eager-prefill registration: record one routed layer's GGUF expert offsets and
+   per-expert strides at model open. The caller (ds4.c weights_bind) MUST pass the
+   identical values the decode routed-MoE call uses -- ffn_{gate,up,down}_exps
+   abs_offset and the gate/down expert-byte strides -- so the bulk loader reads
+   bytes byte-identical to the lazy disk path. Pure bookkeeping; no I/O here. The
+   CUDA side asserts these against the live decode offsets before any RAM serve. */
+extern "C" void ds4_gpu_register_expert_layer(uint32_t layer,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (layer >= 256u || gate_expert_bytes == 0 || down_expert_bytes == 0) return;
+    g_expoff[layer].gate_off = gate_off;
+    g_expoff[layer].up_off = up_off;
+    g_expoff[layer].down_off = down_off;
+    g_expoff[layer].gate_expert_bytes = gate_expert_bytes;
+    g_expoff[layer].down_expert_bytes = down_expert_bytes;
+    if (layer + 1u > g_expoff_n) g_expoff_n = layer + 1u;
 }
 
 extern "C" void ds4_gpu_finalize_backbone_offsets(void) {

@@ -3124,6 +3124,17 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
         l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
         l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        /* Hand the CUDA host-RAM expert tier this layer's GGUF expert offsets +
+           per-expert strides for eager prefill. The strides MUST match the decode
+           routed-MoE call (ds4.c gpu decode site: gate_expert_bytes = mid_dim *
+           gate_row_bytes, down_expert_bytes = out_dim * down_row_bytes); the CUDA
+           side validates them against the live offsets before serving from RAM. */
+        ds4_gpu_register_expert_layer(il,
+                l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                (uint64_t)l->ffn_gate_exps->dim[1] * routed_expert_row_bytes(l->ffn_gate_exps),
+                (uint64_t)l->ffn_down_exps->dim[1] * routed_expert_row_bytes(l->ffn_down_exps));
+#endif
         l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
         l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
         l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
