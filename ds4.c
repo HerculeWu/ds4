@@ -9360,8 +9360,16 @@ static bool metal_graph_alloc_raw_cap(
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
+    /* Multi-GPU pipeline split (Phase 8): the single-token decode tensors must be
+       reachable from whichever device runs each layer. Forcing MANAGED (unified)
+       memory lets each layer's KV/scratch settle on its owning device after first
+       access, and the inter-layer carry migrate across the one device boundary, with
+       no per-field duplication. On a 1-GPU build multi==false so everything stays
+       device-local exactly as before -> byte-identical AND perf-identical. (The
+       prefill/batch tensors are NOT converted; prefill runs wholly on device 0.) */
+    const bool multi = ds4_gpu_device_count() > 1;
     const bool managed_kv_cache =
-        ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+        multi || ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -9380,10 +9388,15 @@ static bool metal_graph_alloc_raw_cap(
                 (double)context_bytes / 1073741824.0);
     }
 
-    g->cur_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->flat_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->hc_mix = ds4_gpu_tensor_alloc(mix_hc * sizeof(float));
-    g->hc_split = ds4_gpu_tensor_alloc(mix_hc * sizeof(float));
+    /* ALLOC_DS: managed (unified) when multi-GPU so the tensor is reachable from
+       whichever device runs its layer; plain device memory on 1 GPU (unchanged).
+       #undef'd right after the decode-tensor block -- the prefill/batch tensors that
+       follow keep plain device allocation because prefill runs wholly on device 0. */
+    #define ALLOC_DS(bytes) (multi ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes))
+    g->cur_hc = ALLOC_DS(hc_dim * sizeof(float));
+    g->flat_hc = ALLOC_DS(hc_dim * sizeof(float));
+    g->hc_mix = ALLOC_DS(mix_hc * sizeof(float));
+    g->hc_split = ALLOC_DS(mix_hc * sizeof(float));
     g->hc_pre = ds4_gpu_tensor_view(g->hc_split, 0, (uint64_t)DS4_N_HC * sizeof(float));
     g->hc_post = ds4_gpu_tensor_view(g->hc_split,
                                        (uint64_t)DS4_N_HC * sizeof(float),
@@ -9391,13 +9404,13 @@ static bool metal_graph_alloc_raw_cap(
     g->hc_comb = ds4_gpu_tensor_view(g->hc_split,
                                        2ull * DS4_N_HC * sizeof(float),
                                        (uint64_t)DS4_N_HC * DS4_N_HC * sizeof(float));
-    g->attn_cur = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->attn_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->qr = ds4_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->qr_norm = ds4_gpu_tensor_alloc(q_rank * sizeof(float));
-    g->q = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-    g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    g->attn_cur = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->attn_norm = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->qr = ALLOC_DS(q_rank * sizeof(float));
+    g->qr_norm = ALLOC_DS(q_rank * sizeof(float));
+    g->q = ALLOC_DS(q_dim * sizeof(float));
+    g->kv_raw = ALLOC_DS((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    g->kv = ALLOC_DS((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
@@ -9412,13 +9425,13 @@ static bool metal_graph_alloc_raw_cap(
                     managed_kv_cache,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
-            g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-            g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_kv[il] = ALLOC_DS(attn_width * attn_rows * sizeof(float));
+            g->layer_attn_state_score[il] = ALLOC_DS(attn_width * attn_rows * sizeof(float));
             if (enable_mtp) {
-                g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->spec_attn_state_kv[il] = ALLOC_DS(attn_width * attn_rows * sizeof(float));
+                g->spec_attn_state_score[il] = ALLOC_DS(attn_width * attn_rows * sizeof(float));
+                g->spec_prefix1_attn_state_kv[il] = ALLOC_DS(attn_width * attn_rows * sizeof(float));
+                g->spec_prefix1_attn_state_score[il] = ALLOC_DS(attn_width * attn_rows * sizeof(float));
             }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
@@ -9435,13 +9448,13 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor(
                         managed_kv_cache,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-                g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                g->layer_index_state_kv[il] = ALLOC_DS(index_width * index_rows * sizeof(float));
+                g->layer_index_state_score[il] = ALLOC_DS(index_width * index_rows * sizeof(float));
                 if (enable_mtp) {
-                    g->spec_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
-                    g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->spec_index_state_kv[il] = ALLOC_DS(index_width * index_rows * sizeof(float));
+                    g->spec_index_state_score[il] = ALLOC_DS(index_width * index_rows * sizeof(float));
+                    g->spec_prefix1_index_state_kv[il] = ALLOC_DS(index_width * index_rows * sizeof(float));
+                    g->spec_prefix1_index_state_score[il] = ALLOC_DS(index_width * index_rows * sizeof(float));
                 }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
@@ -9454,43 +9467,43 @@ static bool metal_graph_alloc_raw_cap(
             }
         }
     }
-    g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
+    g->comp_kv_cur = ALLOC_DS(comp_width_max * sizeof(float));
+    g->comp_sc_cur = ALLOC_DS(comp_width_max * sizeof(float));
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
-        g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
+        g->attn_comp_stage = ALLOC_DS((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
     }
-    g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
-    g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-    g->indexer_scores = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
-    g->comp_mask = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
-    g->comp_selected = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
+    g->indexer_q = ALLOC_DS(indexer_q_dim * sizeof(float));
+    g->indexer_weights = ALLOC_DS((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
+    g->indexer_scores = ALLOC_DS((uint64_t)g->comp_cap * pc * sizeof(float));
+    g->comp_mask = ALLOC_DS((uint64_t)g->comp_cap * pc * sizeof(float));
+    g->comp_selected = ALLOC_DS((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
-    g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->attn_low = ds4_gpu_tensor_alloc(low_dim * sizeof(float));
-    g->attn_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_attn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->ffn_cur = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->ffn_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->shared_gate = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_up = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_mid = ds4_gpu_tensor_alloc(shared_dim * sizeof(float));
-    g->shared_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->router_logits = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
-    g->router_probs = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
-    g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
-    g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
-    g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-    g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->after_ffn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->output_pre = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
-    g->output_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
-    g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-    g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    g->heads = ALLOC_DS(q_dim * sizeof(float));
+    g->attn_low = ALLOC_DS(low_dim * sizeof(float));
+    g->attn_out = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->after_attn_hc = ALLOC_DS(hc_dim * sizeof(float));
+    g->ffn_cur = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->ffn_norm = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->shared_gate = ALLOC_DS(shared_dim * sizeof(float));
+    g->shared_up = ALLOC_DS(shared_dim * sizeof(float));
+    g->shared_mid = ALLOC_DS(shared_dim * sizeof(float));
+    g->shared_out = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->router_logits = ALLOC_DS(DS4_N_EXPERT * sizeof(float));
+    g->router_probs = ALLOC_DS(DS4_N_EXPERT * sizeof(float));
+    g->router_selected = ALLOC_DS(DS4_N_EXPERT_USED * sizeof(int));
+    g->router_weights = ALLOC_DS(DS4_N_EXPERT_USED * sizeof(float));
+    g->routed_gate = ALLOC_DS((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_up = ALLOC_DS((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_mid = ALLOC_DS((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->routed_down = ALLOC_DS((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+    g->routed_out = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->after_ffn_hc = ALLOC_DS(hc_dim * sizeof(float));
+    g->output_pre = ALLOC_DS((uint64_t)DS4_N_HC * sizeof(float));
+    g->output_weights = ALLOC_DS((uint64_t)DS4_N_HC * sizeof(float));
+    g->output_embd = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->output_norm = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->logits = ALLOC_DS(vocab_dim * sizeof(float));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -9498,21 +9511,22 @@ static bool metal_graph_alloc_raw_cap(
      * and no MTP scratch hidden behind otherwise unused tensors.
      */
     if (enable_mtp) {
-        g->mtp_embed = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_enorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_eproj = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
-        g->mtp_eproj_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_hnorm_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_hproj_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-        g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+        g->mtp_embed = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_enorm = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_eproj = ALLOC_DS((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_eproj_hc = ALLOC_DS(hc_dim * sizeof(float));
+        g->mtp_hnorm_hc = ALLOC_DS(hc_dim * sizeof(float));
+        g->mtp_hproj_hc = ALLOC_DS(hc_dim * sizeof(float));
+        g->mtp_input_hc = ALLOC_DS(hc_dim * sizeof(float));
+        g->mtp_state_hc = ALLOC_DS(hc_dim * sizeof(float));
+        g->mtp_next_hc = ALLOC_DS(hc_dim * sizeof(float));
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
-        g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
+        g->spec_logits = ALLOC_DS((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
+    #undef ALLOC_DS
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -11631,6 +11645,13 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
+    /* Multi-GPU pipeline split: a decode token starts on the device that owns layer 0
+       (always device 0, which also holds token_embd). Reset here because the previous
+       token ended on the last layer's device. ds4_gpu_set_active_device / layer_device
+       are no-ops on a 1-GPU build, so this is byte-identical there. */
+    int cur_dev = ds4_gpu_layer_device(0);
+    ds4_gpu_set_active_device(cur_dev);
+
     bool ok = ds4_gpu_embed_token_row_hc_tensor(g->cur_hc,
                                               model->map,
                                               model->size,
@@ -11656,6 +11677,19 @@ static bool metal_graph_encode_token_raw_swa(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* Pipeline split: run this layer wholly on its owning device. At a device
+           boundary, drain the producing device first so the (managed) inter-layer
+           carry in cur_hc is complete before the next device touches it; the carry
+           then migrates on first access. NO floating-point accumulation crosses the
+           boundary -- the whole layer (attention, router, routed-MoE incl. the fused
+           expert down-sum) runs on one device in the same order as single-GPU, so the
+           logits stay bit-identical. Inert when every layer maps to device 0. */
+        int ld = ds4_gpu_layer_device(il);
+        if (ld != cur_dev) {
+            ds4_gpu_synchronize();
+            ds4_gpu_set_active_device(ld);
+            cur_dev = ld;
+        }
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -11675,7 +11709,16 @@ static bool metal_graph_encode_token_raw_swa(
     }
 
     if (ok && need_logits) {
+        /* output_norm + head + argmax run on cur_dev == the last layer's device, over
+           the complete (managed) logits -- the logits never cross a device boundary. */
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    }
+    /* Multi-GPU: drain the last device (the head's work) and restore device 0 so the
+       next token's embed + any between-token GPU op start from a known device. The
+       caller's logits read is on managed memory and is correct from any device. */
+    if (ds4_gpu_device_count() > 1) {
+        ds4_gpu_synchronize();
+        ds4_gpu_set_active_device(0);
     }
     return ok;
 }

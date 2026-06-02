@@ -4198,6 +4198,13 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return ds4_gpu_tensor_alloc(bytes);
 }
 
+/* Multi-GPU pipeline split is CUDA-only; Metal is single-device. These no-ops keep
+   the shared decode-graph code (ds4.c, compiled for Metal + CUDA) linking on Metal,
+   where the layer map is trivially all-device-0 and the active-device switch is inert. */
+int ds4_gpu_device_count(void) { return 1; }
+int ds4_gpu_layer_device(uint32_t layer) { (void)layer; return 0; }
+int ds4_gpu_set_active_device(int dev) { return dev == 0; }
+
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     (void)kv_cache_bytes;
     (void)context_bytes;
