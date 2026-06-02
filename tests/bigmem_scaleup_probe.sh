@@ -5,6 +5,16 @@
 # SUMMARY block back so the defaults (headroom / margin / prefill ceiling) can be
 # tuned to the real hardware.
 #
+# IMPORTANT — exercising the host RAM tier (A40 48 GB target, not an 80 GB card):
+#   The host RAM tier only SERVES an expert that was (1) disk-filled + captured to
+#   RAM, (2) EVICTED from the VRAM slotbank, (3) re-requested. On a card big enough
+#   to hold ~all experts in VRAM, nothing ever evicts, so "host hit" stays 0 and the
+#   RAM tier looks idle — that is correct, not a bug. To prove the RAM tier on a
+#   48 GB card the decode must touch MORE DISTINCT experts than the slotbank has
+#   slots (~5600 on 48 GB), so NTOK must be large. Default is 512; use NTOK=1024+
+#   to force heavy eviction. A long run that evicts-and-recalls is ALSO the first
+#   real correctness test of the RAM->VRAM serve path (a big card never serves).
+#
 # What it proves / measures, all on ONE freshly built `cuda-bigmem` binary
 # (the gate honors the runtime DS4_BIGMEM env in BOTH directions, so the same
 # binary is its own A/B):
@@ -34,7 +44,7 @@
 # Env:
 #   DS4_BIN    ds4 binary                 (default: ./ds4)
 #   DS4_MODEL  gguf path                  (default: ds4flash.gguf)
-#   NTOK       tokens to generate         (default: 256)
+#   NTOK       tokens to generate         (default: 512; use 1024+ to stress eviction)
 #   CTX        context window             (default: 8192)
 #   DS4_ARCH   nvcc -arch for the build   (default: native)
 #   REBUILD    1 = make clean && cuda-bigmem; 0 = use existing binary (default: 1)
@@ -47,7 +57,7 @@ cd "$HERE"
 
 DS4_BIN="${DS4_BIN:-./ds4}"
 DS4_MODEL="${DS4_MODEL:-ds4flash.gguf}"
-NTOK="${NTOK:-256}"
+NTOK="${NTOK:-512}"
 CTX="${CTX:-8192}"
 DS4_ARCH="${DS4_ARCH:-native}"
 REBUILD="${REBUILD:-1}"
@@ -114,15 +124,24 @@ fi
 
 # --- run helper -------------------------------------------------------------
 # run_ds4 <tag> <bigmem 0|1> -> writes $WORK/<tag>.out (stdout) + .err (stderr),
-# polls peak VRAM into $WORK/<tag>.vram
+# polls peak VRAM into $WORK/<tag>.vram and peak host RSS into $WORK/<tag>.rss.
+# (pinned host RAM from the expert RAM tier shows up in the process RSS, so RSS is
+#  the right thing to watch against a 128 GiB cap on a shared node where
+#  /proc/meminfo reports the whole machine, not your cgroup.)
+PROC="$(basename "$DS4_BIN")"
 run_ds4(){
   local tag="$1" bm="$2"
-  local vramfile="$WORK/$tag.vram" pollpid=""
-  : > "$vramfile"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    ( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 >> "$vramfile"; sleep 0.5; done ) &
-    pollpid=$!
-  fi
+  local vramfile="$WORK/$tag.vram" rssfile="$WORK/$tag.rss" pollpid=""
+  : > "$vramfile"; : > "$rssfile"
+  (
+    while :; do
+      command -v nvidia-smi >/dev/null 2>&1 && \
+        nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 >> "$vramfile"
+      ps --no-headers -o rss -C "$PROC" 2>/dev/null | sort -rn | head -1 >> "$rssfile"
+      sleep 0.5
+    done
+  ) &
+  pollpid=$!
   env DS4_BIGMEM="$bm" DS4_CUDA_WEIGHT_CACHE_VERBOSE=1 \
       "$DS4_BIN" -m "$DS4_MODEL" -c "$CTX" -n "$NTOK" --temp 0 \
       -sys "$SYS" -p "$PROMPT" > "$WORK/$tag.out" 2> "$WORK/$tag.err"
@@ -132,8 +151,14 @@ run_ds4(){
 }
 
 peak_vram(){ awk 'BEGIN{m=0}{if($1+0>m)m=$1+0}END{print m" MiB"}' "$WORK/$1.vram" 2>/dev/null; }
+peak_rss(){ awk 'BEGIN{m=0}{if($1+0>m)m=$1+0}END{printf "%.1f GiB", m/1048576}' "$WORK/$1.rss" 2>/dev/null; }
 ts_line(){ grep -oE 'prefill: [0-9.]+ t/s, generation: [0-9.]+ t/s' "$WORK/$1.err" | tail -1; }
 gen_ts(){ grep -oE 'generation: [0-9.]+ t/s' "$WORK/$1.err" | tail -1 | grep -oE '[0-9.]+'; }
+# slotbank / RAM-tier sizing and the final cumulative host-tier hit/miss counters
+sb_slots(){ grep -oE 'CUDA slotbank [0-9]+ slots' "$WORK/$1.err" | head -1 | grep -oE '[0-9]+' | head -1; }
+ram_slots(){ grep -oE 'CUDA expert RAM tier [0-9]+ slots' "$WORK/$1.err" | head -1 | grep -oE '[0-9]+' | head -1; }
+host_hit(){ grep -oE 'host hit=[0-9]+' "$WORK/$1.err" | tail -1 | grep -oE '[0-9]+'; }
+host_miss(){ grep -oE 'host hit=[0-9]+ miss=[0-9]+' "$WORK/$1.err" | tail -1 | grep -oE 'miss=[0-9]+' | grep -oE '[0-9]+'; }
 
 # --- 3. BIGMEM ON -----------------------------------------------------------
 rule; say "[3] RUN  DS4_BIGMEM=1  (scale-up ON)  — first token warms the tiers from disk"
@@ -148,6 +173,7 @@ grep -iE "host hit|expram L|host_hit|vram hit" "$WORK/on.err" | tail -4 | sed 's
 say "  --- any FATAL / OOM / error ---"
 grep -iE "FATAL|out of memory|OOM|failed|abort" "$WORK/on.err" | grep -viE "decode failed: $" | head -8 | sed 's/^/    /' || true
 say "  peak VRAM used (ON): $(peak_vram on)"
+say "  peak host RSS (ON): $(peak_rss on)   (expert RAM tier is pinned -> counts here; keep under your usable RAM)"
 say "  timing (ON): $(ts_line on)"
 
 # --- 4. BIGMEM OFF (baseline) ----------------------------------------------
@@ -155,6 +181,7 @@ rule; say "[4] RUN  DS4_BIGMEM=0  (baseline: streaming backbone + LRU)"
 run_ds4 off 0; RC_OFF=$?
 say "  exit: $RC_OFF"
 say "  peak VRAM used (OFF): $(peak_vram off)"
+say "  peak host RSS (OFF): $(peak_rss off)"
 say "  timing (OFF): $(ts_line off)"
 
 # --- 5. correctness: byte-identical greedy output --------------------------
@@ -180,6 +207,21 @@ fi
 BB_RESIDENT="no"; grep -q "backbone VRAM-resident" "$WORK/on.err" && BB_RESIDENT="YES"
 BB_SKIP="$(grep -oE 'backbone VRAM residency skipped[^\n]*' "$WORK/on.err" | head -1)"
 RAM_FULL="no"; grep -q "auto-scaled to full pool" "$WORK/on.err" && RAM_FULL="YES"
+SB="$(sb_slots on)"; RS="$(ram_slots on)"
+HH="$(host_hit on)"; HM="$(host_miss on)"
+HRATE="n/a"
+if [ -n "${HH:-}" ] && [ -n "${HM:-}" ]; then
+  HRATE="$(awk -v h="$HH" -v m="$HM" 'BEGIN{ t=h+m; if(t>0) printf "%.0f%%", 100*h/t; else print "n/a" }')"
+fi
+# Did an expert ever get served from the RAM tier (the thing a 48 GB card needs and an 80 GB card never triggers)?
+RAM_SERVED="no — working set fit VRAM, RAM tier idle (fine on a big card; raise NTOK to force eviction)"
+if [ -n "${HH:-}" ] && [ "${HH:-0}" -gt 0 ] 2>/dev/null; then
+  RAM_SERVED="YES — $HH experts served RAM->VRAM over PCIe instead of disk"
+fi
+EVICT="?"
+if [ -n "${SB:-}" ] && [ -n "${RS:-}" ]; then
+  if [ "$SB" -lt "$RS" ] 2>/dev/null; then EVICT="VRAM holds $SB of $RS experts -> eviction CAN occur"; else EVICT="VRAM holds all $RS experts -> no eviction (RAM tier moot)"; fi
+fi
 
 rule
 say "==================  SUMMARY (paste this back)  =================="
@@ -191,7 +233,11 @@ say "  ctx=$CTX  ntok=$NTOK"
 say "  ----"
 say "  backbone VRAM-resident : $BB_RESIDENT   ${BB_SKIP:+[$BB_SKIP]}"
 say "  expert RAM -> full pool: $RAM_FULL"
+say "  VRAM vs full expert set: ${EVICT:-?}"
+say "  RAM tier served (host) : $RAM_SERVED"
+say "                           [final host hit/miss = ${HH:-?}/${HM:-?}, host-hit rate ${HRATE}]"
 say "  peak VRAM  ON / OFF    : $(peak_vram on)  /  $(peak_vram off)"
+say "  peak host RSS ON / OFF : $(peak_rss on)  /  $(peak_rss off)"
 say "  generation t/s ON / OFF: ${GON:-?}  /  ${GOFF:-?}   speedup: $SPEEDUP"
 say "  prefill+gen  ON        : $(ts_line on)"
 say "  correctness            : $CORRECT"
@@ -199,5 +245,10 @@ say "  exits  ON / OFF        : $RC_ON / $RC_OFF"
 say "================================================================"
 say ""
 say "Full log saved to: $LOG"
-say "(If 'backbone VRAM-resident' is 'no' with a skipped line, the slab did not"
-say " fit free VRAM — paste the SUMMARY and I'll lower the 2 GiB headroom.)"
+say "Reading this back:"
+say "  * 'backbone VRAM-resident: no' + a skipped line -> slab didn't fit; I lower the headroom."
+say "  * 'VRAM holds all N experts -> no eviction' on a 48 GB card -> NTOK too small;"
+say "    re-run with NTOK=1024+ so the RAM tier actually gets exercised."
+say "  * 'RAM tier served: YES' with correctness PASS -> the RAM->VRAM serve path is"
+say "    proven on real eviction (a big card can't prove this)."
+say "  * peak host RSS approaching your usable RAM -> I add a host-RAM ceiling knob."
