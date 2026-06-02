@@ -94,15 +94,69 @@ extern "C" int ds4_gpu_bigmem(void) {
     return v;
 }
 
+/* ---- Per-device runtime state (multi-GPU pipeline split, Phase 8) --------------
+   Every device-resident runtime tier is held per-device in g_dev[]; g_cur names
+   the device currently being driven. The macros below are the "current-device
+   view": existing single-device code (g_cublas, g_slotbank, g_bbvram_base, ...)
+   compiles UNCHANGED and resolves to g_dev[g_cur].*, so a 1-GPU build (g_ngpu==1,
+   g_cur always 0) is byte-for-byte the previous single-global path. The pipeline
+   layer split (Phase 3) assigns each contiguous block of layers to one device and
+   sets g_cur at the layer boundary; the ONLY thing that crosses a device boundary
+   is a bit-exact copy of the inter-layer carry -- NO floating-point accumulation
+   ever crosses (that is the byte-identical invariant; see moe_down_sum6 below).
+   Code that drives a SPECIFIC device (init/cleanup loops) writes g_dev[d].* directly.
+   NOT per-device (kept as single instances, deliberately outside this struct):
+   model-derived slot geometry (g_slot_bytes, g_slot_*_off/_bytes, topology hints)
+   is identical on every device; the host-shared tiers (g_expram, g_bb_ram,
+   g_expoff registry, g_model_stage* staging, the model map/ranges/q8 caches) live
+   in host RAM or are written once at load and read by whichever device owns the
+   consuming layer. */
+#define DS4_MAX_GPUS 8
+struct gpu_dev {
+    cublasHandle_t cublas;          int      cublas_ready;
+    cudaStream_t   upload_stream;            /* H2D tier fills + the one named-stream kernel */
+    cudaStream_t   prefetch_stream;          /* model prefetch (HMM/ATS) */
+    cuda_slotbank  slotbank;        char    *slotbank_base;  int slotbank_ready;  /* VRAM expert LRU */
+    int32_t       *slot_id_scratch; uint32_t slot_id_scratch_cap;                 /* selected[]->slot remap */
+    char          *bbring_base;     uint64_t bbring_bytes;   bbr_ring_state bbring;  int bbring_inited;
+    char          *bbvram_base;     char   **bbvram_ptr;     uint64_t bbvram_bytes;  int bbvram_ready;
+    void          *bb_transient;             /* output-head oversized transient (last device) */
+    char          *embd_rows_dev;   uint64_t embd_rows_cap;                       /* embed gather (dev0) */
+    void          *cuda_tmp;        uint64_t cuda_tmp_bytes;                      /* generic device scratch */
+};
+static gpu_dev g_dev[DS4_MAX_GPUS];
+static int     g_ngpu = 1;   /* device count; 1 => the unchanged single-GPU path */
+static int     g_cur  = 0;   /* active device index into g_dev[] (== current CUDA device) */
+
+#define g_cublas                (g_dev[g_cur].cublas)
+#define g_cublas_ready          (g_dev[g_cur].cublas_ready)
+#define g_model_upload_stream   (g_dev[g_cur].upload_stream)
+#define g_model_prefetch_stream (g_dev[g_cur].prefetch_stream)
+#define g_slotbank              (g_dev[g_cur].slotbank)
+#define g_slotbank_base         (g_dev[g_cur].slotbank_base)
+#define g_slotbank_ready        (g_dev[g_cur].slotbank_ready)
+#define g_slot_id_scratch       (g_dev[g_cur].slot_id_scratch)
+#define g_slot_id_scratch_cap   (g_dev[g_cur].slot_id_scratch_cap)
+#define g_bbring_base           (g_dev[g_cur].bbring_base)
+#define g_bbring_bytes          (g_dev[g_cur].bbring_bytes)
+#define g_bbring                (g_dev[g_cur].bbring)
+#define g_bbring_inited         (g_dev[g_cur].bbring_inited)
+#define g_bbvram_base           (g_dev[g_cur].bbvram_base)
+#define g_bbvram_ptr            (g_dev[g_cur].bbvram_ptr)
+#define g_bbvram_bytes          (g_dev[g_cur].bbvram_bytes)
+#define g_bbvram_ready          (g_dev[g_cur].bbvram_ready)
+#define g_bb_transient          (g_dev[g_cur].bb_transient)
+#define g_embd_rows_dev         (g_dev[g_cur].embd_rows_dev)
+#define g_embd_rows_cap         (g_dev[g_cur].embd_rows_cap)
+#define g_cuda_tmp              (g_dev[g_cur].cuda_tmp)
+#define g_cuda_tmp_bytes        (g_dev[g_cur].cuda_tmp_bytes)
+
 /* ---- Phase 3 backbone streaming statics (share the slotbank staging pipeline) ---- */
 static bbr_registry   g_bb_registry;          /* populated at model open */
 static int            g_bb_registry_inited = 0;
 
-static char           *g_bbring_base = NULL;     /* one cudaMalloc */
-static uint64_t        g_bbring_bytes = 0;
-static bbr_ring_state  g_bbring;                 /* from ds4_backbone_ring_core.h */
-static int             g_bbring_inited = 0;
-static void           *g_bb_transient = NULL;    /* output-head oversized buffer */
+/* g_bbring_base/_bytes/_inited, g_bbring (bbr_ring_state) and g_bb_transient are
+   per-device -> moved into gpu_dev (see the macro block above). */
 
 /* Bigmem: persistent VRAM-resident backbone. The default path re-uploads the
    whole dense backbone (~8.8 GiB on Flash) H2D every token through the epoch ring
@@ -116,10 +170,8 @@ static void           *g_bb_transient = NULL;    /* output-head oversized buffer
    DS4_CUDA_BACKBONE_VRAM; on any failure g_bbvram_ready = -1 and the backbone
    simply streams through the ring as before. The uploaded bytes are byte-identical
    to the streamed bytes, so prefill and decode both stay golden. */
-static char           *g_bbvram_base = NULL;     /* one cudaMalloc'd device slab */
-static char          **g_bbvram_ptr  = NULL;     /* per-span device base, parallel to g_bb_registry.spans */
-static uint64_t        g_bbvram_bytes = 0;        /* slab size (sum of 256-aligned span bytes) */
-static int             g_bbvram_ready = 0;        /* 0 uninit, 1 ready, -1 disabled */
+/* g_bbvram_base/_ptr/_bytes/_ready are per-device -> moved into gpu_dev (macro block
+   above). Each device's slab holds only the backbone spans for the layers it owns. */
 
 /* Phase 4: backbone host RAM residency cache.
    The 8.8 GB dense backbone (attn proj, shared expert, norms, router, etc.) is
@@ -241,10 +293,10 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
-static cudaStream_t g_model_prefetch_stream;
-static cudaStream_t g_model_upload_stream;
-static cublasHandle_t g_cublas;
-static int g_cublas_ready;
+/* g_model_prefetch_stream, g_model_upload_stream, g_cublas, g_cublas_ready are
+   per-device -> moved into gpu_dev (macro block above). g_quality_mode is the
+   model-wide math-mode policy and stays a single instance (applied identically to
+   every per-device cublas handle so dense matmuls round the same on each card). */
 static int g_quality_mode;
 
 struct cuda_model_range {
@@ -289,8 +341,9 @@ static uint64_t g_model_range_bytes;
    expert's gate|up|down contiguously and byte-identical to the source GGUF block
    so the kernels' intra-expert row stride is unchanged. Defined here but not yet
    wired into routed_moe_launch (that is Task 6). */
-static cuda_slotbank g_slotbank;
-static char    *g_slotbank_base;       /* single cudaMalloc'd slab */
+/* g_slotbank, g_slotbank_base, g_slotbank_ready and g_slot_id_scratch[_cap] are
+   per-device -> moved into gpu_dev (macro block above). The slot GEOMETRY below is
+   model-derived and identical on every device, so it stays a single instance. */
 static uint64_t g_slot_bytes;          /* per-slot size (gate+up+down, 256-aligned) */
 static uint64_t g_slot_gate_off;       /* intra-slot byte offsets */
 static uint64_t g_slot_up_off;
@@ -298,11 +351,8 @@ static uint64_t g_slot_down_off;
 static uint64_t g_slot_gate_bytes;     /* per-expert component sizes (== source GGUF) */
 static uint64_t g_slot_up_bytes;
 static uint64_t g_slot_down_bytes;
-static int      g_slotbank_ready;
 static uint32_t g_model_n_layer;        /* topology hint (set at model open); 0 = unknown */
 static uint32_t g_model_n_total_expert; /* routed experts per layer; 0 = unknown */
-static int32_t *g_slot_id_scratch;        /* persistent device buffer: selected[]->slot remap */
-static uint32_t g_slot_id_scratch_cap;    /* capacity in int32 elements */
 
 /* Phase 5: host-RAM second tier for routed experts -- the SSD->RAM->VRAM "RAM"
    tier. Structurally identical to the VRAM g_slotbank (same cuda_slotbank, same
@@ -350,8 +400,7 @@ static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
-static void *g_cuda_tmp;
-static uint64_t g_cuda_tmp_bytes;
+/* g_cuda_tmp[_bytes] is per-device device scratch -> moved into gpu_dev. */
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -2261,33 +2310,112 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+/* Math mode is a MODEL-WIDE policy (TF32 vs default), applied IDENTICALLY to every
+   per-device cublas handle: a per-device divergence would make dense matmuls round
+   differently on one card and silently break the byte-identical decode. */
+static cublasMath_t cuda_math_mode(void) {
+    return (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+               ? CUBLAS_DEFAULT_MATH
+               : CUBLAS_TF32_TENSOR_OP_MATH;
+}
+
+/* Device count = min(visible devices, DS4_CUDA_DEVICES cap, DS4_MAX_GPUS).
+   DS4_CUDA_DEVICES is a diagnostic CAP, not a semantic flag (CLAUDE.md): it lets
+   the 2-card box force the single-GPU topology (DS4_CUDA_DEVICES=1) to reproduce
+   the byte-identical 1-GPU oracle ON the only hardware that has two cards. Default
+   = all visible devices. */
+static int cuda_pick_ngpu(void) {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) { (void)cudaGetLastError(); n = 1; }
+    if (n > DS4_MAX_GPUS) n = DS4_MAX_GPUS;
+    const char *e = getenv("DS4_CUDA_DEVICES");
+    if (e && e[0]) {
+        char *p = NULL; long v = strtol(e, &p, 10);
+        if (p != e && v >= 1 && v < n) n = (int)v;
+    }
+    return n;
+}
+
 extern "C" int ds4_gpu_init(void) {
-    int dev = 0;
-    if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
-    cudaDeviceProp prop;
-    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
-                prop.name, prop.major, prop.minor);
+    g_ngpu = cuda_pick_ngpu();
+    /* Create a cublas handle on every device with an identical math mode. Streams
+       and the VRAM tiers stay LAZILY created per device, so a 1-GPU run (g_ngpu==1)
+       touches exactly the same device/allocation sequence as before -> byte-identical. */
+    const cublasMath_t math_mode = cuda_math_mode();
+    for (int d = 0; d < g_ngpu; d++) {
+        if (!cuda_ok(cudaSetDevice(d), "set device")) return 0;
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA device %d/%d: %s (sm_%d%d)\n",
+                    d, g_ngpu, prop.name, prop.major, prop.minor);
+        }
+        if (!g_dev[d].cublas_ready) {
+            if (!cublas_ok(cublasCreate(&g_dev[d].cublas), "create handle")) return 0;
+            (void)cublasSetMathMode(g_dev[d].cublas, math_mode);
+            g_dev[d].cublas_ready = 1;
+        }
     }
-    if (!g_cublas_ready) {
-        if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
-        g_cublas_ready = 1;
+    /* Pipeline layer split (Phase 3) copies the inter-layer carry across the single
+       device boundary; enable peer access pairwise so that copy can be a direct
+       cudaMemcpyPeer. Where a pair has no P2P we log it and host-bounce at copy time
+       (still bit-exact). Best-effort; skipped entirely on a 1-GPU box. */
+    if (g_ngpu > 1) {
+        for (int i = 0; i < g_ngpu; i++) {
+            if (cudaSetDevice(i) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+            for (int j = 0; j < g_ngpu; j++) {
+                if (i == j) continue;
+                int can = 0;
+                if (cudaDeviceCanAccessPeer(&can, i, j) == cudaSuccess && can) {
+                    cudaError_t pe = cudaDeviceEnablePeerAccess(j, 0);
+                    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled)
+                        (void)cudaGetLastError();
+                } else {
+                    (void)cudaGetLastError();
+                    fprintf(stderr, "ds4: P2P %d->%d unavailable; layer-boundary carry will host-bounce\n", i, j);
+                }
+            }
+        }
     }
-    return 1;
+    g_cur = 0;
+    return cuda_ok(cudaSetDevice(0), "set device 0");
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    (void)cudaDeviceSynchronize();
-    if (g_cublas_ready) {
-        (void)cublasDestroy(g_cublas);
-        g_cublas_ready = 0;
-        g_cublas = NULL;
+    /* Per-device runtime teardown. Every card got a cublas handle at init and may
+       have lazily created an upload/prefetch stream and a cuda_tmp scratch while it
+       was the active device, so destroy those on their OWN device. (The big
+       process-lifetime VRAM tiers -- slotbank/bbvram/bbring slabs -- are reclaimed at
+       process exit / by their own reset paths and are not touched here.) On a 1-GPU
+       box this loop runs once for device 0, exactly as before. */
+    int prev = 0; (void)cudaGetDevice(&prev);
+    for (int d = 0; d < g_ngpu; d++) {
+        if (cudaSetDevice(d) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+        (void)cudaDeviceSynchronize();
+        if (g_dev[d].cublas_ready) {
+            (void)cublasDestroy(g_dev[d].cublas);
+            g_dev[d].cublas_ready = 0;
+            g_dev[d].cublas = NULL;
+        }
+        if (g_dev[d].cuda_tmp) {
+            (void)cudaFree(g_dev[d].cuda_tmp);
+            g_dev[d].cuda_tmp = NULL;
+            g_dev[d].cuda_tmp_bytes = 0;
+        }
+        if (g_dev[d].upload_stream) {
+            (void)cudaStreamDestroy(g_dev[d].upload_stream);
+            g_dev[d].upload_stream = NULL;
+        }
+        if (g_dev[d].prefetch_stream) {
+            (void)cudaStreamDestroy(g_dev[d].prefetch_stream);
+            g_dev[d].prefetch_stream = NULL;
+        }
     }
+    (void)cudaSetDevice(0);
+    g_cur = 0;
+
+    /* Host-shared / model-map teardown -- device-agnostic, done once. The q8 and
+       model-device frees below target device-0 allocations (model load device), so
+       they run after the loop has restored device 0 as current. */
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -2298,11 +2426,6 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
-    if (g_cuda_tmp) {
-        (void)cudaFree(g_cuda_tmp);
-        g_cuda_tmp = NULL;
-        g_cuda_tmp_bytes = 0;
-    }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -2315,10 +2438,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     g_model_stage_bytes = 0;
-    if (g_model_upload_stream) {
-        (void)cudaStreamDestroy(g_model_upload_stream);
-        g_model_upload_stream = NULL;
-    }
+    (void)prev;
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
     }
@@ -2339,10 +2459,6 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     g_model_direct_align = 1;
     g_model_file_size = 0;
-    if (g_model_prefetch_stream) {
-        (void)cudaStreamDestroy(g_model_prefetch_stream);
-        g_model_prefetch_stream = NULL;
-    }
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -2724,12 +2840,12 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
-    if (g_cublas_ready) {
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
-        (void)cublasSetMathMode(g_cublas, math_mode);
+    /* Re-apply the math mode to EVERY device's handle (not just g_cur's): this
+       setter runs after ds4_gpu_init, and leaving any card on the init-time mode
+       would diverge its dense-matmul rounding from the others -> non-bit-identical. */
+    const cublasMath_t math_mode = cuda_math_mode();
+    for (int d = 0; d < g_ngpu; d++) {
+        if (g_dev[d].cublas_ready) (void)cublasSetMathMode(g_dev[d].cublas, math_mode);
     }
 }
 
@@ -6674,8 +6790,7 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
    only needs the active token rows. We stream just those rows into a small
    device buffer (reused across steps), then run a row-base kernel that indexes
    from row 0. This avoids a 1.059 GiB ring/transient alloc per embed call. */
-static char    *g_embd_rows_dev = NULL;
-static uint64_t g_embd_rows_cap = 0;
+/* g_embd_rows_dev/_cap are per-device (embed runs on dev0) -> moved into gpu_dev. */
 
 static char *cuda_embd_rows_ensure(uint64_t bytes) {
     if (bytes <= g_embd_rows_cap && g_embd_rows_dev) return g_embd_rows_dev;
