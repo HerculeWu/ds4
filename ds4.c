@@ -6662,6 +6662,12 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
         /* v <= 0 / unparseable: keep cap = prompt_len */
     } else if (prompt_len > 4096) {
         cap = 4096u;
+#ifndef DS4_NO_GPU
+        /* Scale-up: default to prefilling the whole prompt in one batch; the
+           VRAM-safe clamp below bounds it. Fewer/larger chunks, identical logits
+           (the KV-accumulation boundary is chunk-invariant). Env still overrides. */
+        if (ds4_gpu_bigmem()) cap = (uint32_t)prompt_len;
+#endif
     }
 
 #ifndef DS4_NO_GPU
@@ -6683,7 +6689,11 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
         const uint64_t per_tok = 1572864ull * (uint64_t)DS4_N_EMBD / 4096ull;
         uint32_t vram_cap = (uint32_t)(avail / per_tok);
         if (vram_cap < 64) vram_cap = 64;       /* floor: always make some progress */
-        if (vram_cap > 4096) vram_cap = 4096;
+        /* Scale-up lifts the 4096 chunk ceiling so a large card can prefill in
+           far fewer batches; `avail` already subtracts the VRAM-resident backbone
+           (ds4_gpu_planned_reserve_bytes) so vram_cap stays VRAM-safe. */
+        const uint32_t pf_ceil = ds4_gpu_bigmem() ? 65536u : 4096u;
+        if (vram_cap > pf_ceil) vram_cap = pf_ceil;
         if (cap > vram_cap) cap = vram_cap;
     }
 #endif

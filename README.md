@@ -169,10 +169,53 @@ settles into steady-state decode.
 | `DS4_CUDA_EXPERT_RAM_CACHE_GB`       | Host-RAM expert-cache size in GiB. `0` disables; unset = sensible default; larger = higher hit rate, more RAM used. |
 | `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1`    | Print per-layer host/VRAM hit/miss and tier init.                   |
 | `DS4_CUDA_SLOTBANK_RESERVE_MB`       | VRAM reserved outside the slot-bank.                                |
+| `DS4_BIGMEM=1`                       | **Scale-up mode** (see below). Turn the big-hardware profile on at runtime on any build; `DS4_BIGMEM=0` turns it off on a `cuda-bigmem` build. |
+| `DS4_CUDA_BACKBONE_VRAM=0`           | Force the dense backbone to stream through the ring even in scale-up mode (per-tier override of the VRAM-resident backbone). |
 
 A bigger cache helps most in **long, single-session** runs (a coding agent,
 say), where cross-token expert reuse keeps climbing past a short benchmark's
 average.
+
+### Scale-up mode: don't smash the ceiling with the floor
+
+The tiering above is built so a frontier model *fits* on a tiny GPU. But the
+same engine should also *use* a big one. **Scale-up mode** raises the defaults
+of the tiers so that, when VRAM and host RAM are plentiful, the SSD→RAM→VRAM
+3-tier collapses toward 2-tier (RAM↔VRAM, disk inert after warmup) and, for the
+dense weights, toward 1-tier (all-VRAM):
+
+```sh
+make clean && make cuda-bigmem      # native arch; or: make cuda-bigmem CUDA_ARCH=sm_86
+# …or build normally and flip it at runtime, no rebuild (easiest for A/B):
+DS4_BIGMEM=1 ./ds4 -m ds4flash.gguf -c 8192 -n 400 -p "…"
+```
+
+(`make clean` is needed when switching between a normal and a `cuda-bigmem`
+build because `make` tracks file timestamps, not compiler flags — same as
+switching `CUDA_ARCH`. The runtime `DS4_BIGMEM=1` avoids that entirely.)
+
+On e.g. an **A40 (48 GB) + 128 GB RAM** box this changes the defaults to:
+
+- **Dense backbone → VRAM-resident.** Uploaded once to a persistent device slab
+  instead of re-streaming ~8.8 GiB host→device *every token* (and the per-token
+  output-head transient disappears too). This is the biggest decode win when
+  VRAM is large.
+- **Full routed-expert pool → RAM-resident.** The host expert tier grows to hold
+  every expert (the disk tier goes inert after warmup). This already happens with
+  the env left unset; scale-up also makes it fire when you've set an explicit
+  (smaller) `DS4_CUDA_EXPERT_RAM_CACHE_GB` — the value becomes a floor, not a cap.
+- **VRAM expert slot-bank → clamped to the model.** It stops greedily grabbing
+  *all* free VRAM and claims only what the full expert set can use, leaving room
+  for the resident backbone and KV.
+- **KV cache → device VRAM for normal contexts**, spilling to host (managed
+  memory) only for genuinely huge contexts that don't fit VRAM.
+- **Prefill → larger VRAM-safe chunks** (fewer batches; identical logits).
+
+Every individual `DS4_CUDA_*` knob still overrides the scale-up default, and the
+inference path is unchanged — scale-up only moves numeric defaults, never forks
+the math. Run with `DS4_CUDA_WEIGHT_CACHE_VERBOSE=1` to confirm the residency
+plan engaged (you'll see the backbone-VRAM-resident line, the expert RAM
+auto-scale-to-full-pool line, and the slot-bank sizing).
 
 ## ⚠️ Honest caveat: testing is thin
 

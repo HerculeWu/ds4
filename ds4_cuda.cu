@@ -71,6 +71,29 @@ typedef struct {
 #include "ds4_slotbank_core.h"
 #include "ds4_backbone_ring_core.h"
 
+/* Scale-up profile gate -- see ds4_gpu.h. Memoized. The runtime DS4_BIGMEM env
+   wins over the compile-time -DDS4_BIGMEM default in both directions, so a
+   bigmem binary can be turned off with DS4_BIGMEM=0 and a normal binary turned
+   on with DS4_BIGMEM=1. Every per-tier knob below only consults this to pick a
+   more aggressive DEFAULT; the matching DS4_CUDA_* env still overrides per tier,
+   and no inference path is forked. */
+extern "C" int ds4_gpu_bigmem(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_BIGMEM");
+        if (e && e[0]) {
+            v = !(e[0] == '0' && e[1] == '\0');   /* explicit runtime override */
+        } else {
+#ifdef DS4_BIGMEM
+            v = 1;                                  /* compiled-in default */
+#else
+            v = 0;
+#endif
+        }
+    }
+    return v;
+}
+
 /* ---- Phase 3 backbone streaming statics (share the slotbank staging pipeline) ---- */
 static bbr_registry   g_bb_registry;          /* populated at model open */
 static int            g_bb_registry_inited = 0;
@@ -80,6 +103,23 @@ static uint64_t        g_bbring_bytes = 0;
 static bbr_ring_state  g_bbring;                 /* from ds4_backbone_ring_core.h */
 static int             g_bbring_inited = 0;
 static void           *g_bb_transient = NULL;    /* output-head oversized buffer */
+
+/* Bigmem: persistent VRAM-resident backbone. The default path re-uploads the
+   whole dense backbone (~8.8 GiB on Flash) H2D every token through the epoch ring
+   (and a per-token cudaMalloc for the oversized output head). When VRAM is large
+   that is wasteful: a one-time upload of every registered backbone span into a
+   permanent device slab lets the resolver return a stable device pointer forever,
+   eliminating the per-token H2D AND the output-head transient. The slab mirrors
+   the sorted bbr_registry 1:1 (g_bbvram_ptr[i] is span i's device base, in the
+   same order), so a lookup is the same binary search as bbr_registry_contains
+   plus an intra-span byte offset. Best-effort and gated by ds4_gpu_bigmem() /
+   DS4_CUDA_BACKBONE_VRAM; on any failure g_bbvram_ready = -1 and the backbone
+   simply streams through the ring as before. The uploaded bytes are byte-identical
+   to the streamed bytes, so prefill and decode both stay golden. */
+static char           *g_bbvram_base = NULL;     /* one cudaMalloc'd device slab */
+static char          **g_bbvram_ptr  = NULL;     /* per-span device base, parallel to g_bb_registry.spans */
+static uint64_t        g_bbvram_bytes = 0;        /* slab size (sum of 256-aligned span bytes) */
+static int             g_bbvram_ready = 0;        /* 0 uninit, 1 ready, -1 disabled */
 
 /* Phase 4: backbone host RAM residency cache.
    The 8.8 GB dense backbone (attn proj, shared expert, norms, router, etc.) is
@@ -1274,7 +1314,12 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
        margin so the head always fits without env tuning. The ring is already
        allocated before slotbank init (layer-0 attention resolves first), so it
        is excluded from `free` and need not be re-counted here. */
-    const uint64_t reserve_scratch = 256ull * 1048576ull;  /* cuBLAS workspace + driver + frag */
+    /* cuBLAS workspace + driver + frag. Bigmem scales it with the card (the flat
+       256 MiB was tuned for the 6 GiB rig) so a large GPU keeps proportional
+       headroom for transients / a wider prefill+cuBLAS working set. */
+    const uint64_t reserve_scratch = ds4_gpu_bigmem()
+        ? (((uint64_t)total_b / 64ull) > 256ull * 1048576ull ? (uint64_t)total_b / 64ull : 256ull * 1048576ull)
+        : 256ull * 1048576ull;
     uint64_t max_transient = g_bb_registry_inited
         ? bbr_registry_max_bytes(&g_bb_registry) : 0;
     uint64_t reserve = max_transient + reserve_scratch;
@@ -1284,6 +1329,18 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
     uint64_t usable = (free_b > reserve) ? ((uint64_t)free_b - reserve) : 0;
     uint64_t env_limit = cuda_model_cache_limit_bytes();   /* UINT64_MAX if unset */
     uint64_t budget = (env_limit < usable) ? env_limit : usable;
+
+    /* Bigmem: never claim more VRAM than the whole routed-expert set can use. The
+       slab is otherwise greedy (all free - reserve); on a large card that grabs
+       tens of GiB of slots beyond the full pool for no benefit (experts past the
+       full set are never touched) while starving the VRAM-resident backbone and
+       the KV cache. Clamp the budget to the full pool so the rest of VRAM stays
+       free for those tiers. No-op on small cards, where full_set*slot >> free, so
+       the 6 GiB floor is unchanged. DS4_CUDA_WEIGHT_CACHE_LIMIT_GB still caps below. */
+    if (ds4_gpu_bigmem() && g_model_n_layer && g_model_n_total_expert) {
+        const uint64_t pool_bytes = (uint64_t)g_model_n_layer * g_model_n_total_expert * slot;
+        if (pool_bytes && budget > pool_bytes) budget = pool_bytes;
+    }
 
     uint32_t n = (uint32_t)(budget / slot);
     if (n < min_slots) {
@@ -1387,6 +1444,93 @@ static int cuda_slotbank_fill(uint32_t s, uint64_t gate_off, uint64_t up_off, ui
     return 1;
 }
 
+/* Bigmem backbone residency (see g_bbvram_* globals). Lazily allocate the device
+   slab on the first backbone resolve: by then the model fd / staging pool / upload
+   stream are ready, the KV cache is already allocated so cudaMemGetInfo reflects
+   it, and this runs BEFORE the lazy slotbank init so the slotbank's free_b excludes
+   the slab. Uploads every registered span once; a per-span stream sync keeps the
+   shared staging buffers safe across spans (one-time cost). Returns 1 if resident. */
+static int cuda_bbvram_init(void) {
+    if (g_bbvram_ready) return g_bbvram_ready == 1;   /* 1 ready / -1 disabled: done */
+    g_bbvram_ready = -1;                              /* pessimistic until proven resident */
+
+    int want = ds4_gpu_bigmem();
+    const char *e = getenv("DS4_CUDA_BACKBONE_VRAM");
+    if (e && e[0]) want = !(e[0] == '0' && e[1] == '\0');   /* explicit per-tier override */
+    if (!want) return 0;
+    if (!g_bb_registry_inited || g_bb_registry.n == 0) return 0;
+    if (!g_bb_registry.sorted) bbr_registry_sort(&g_bb_registry);
+
+    uint64_t need = 0;
+    for (uint32_t i = 0; i < g_bb_registry.n; i++)
+        need += (g_bb_registry.spans[i].bytes + 255ull) & ~255ull;
+    if (need == 0) return 0;
+
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    /* Leave room for the lazy slotbank (>= one per-layer union), KV growth, and
+       driver/frag; the slotbank then sizes itself from the reduced free VRAM. */
+    const uint64_t headroom = 2ull * 1073741824ull;
+    if ((uint64_t)free_b < need + headroom) {
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+            fprintf(stderr, "ds4: CUDA backbone VRAM residency skipped: need %.2f GiB + %.2f GiB "
+                    "headroom > free %.2f GiB (backbone streams through the ring as before)\n",
+                    (double)need / 1073741824.0, (double)headroom / 1073741824.0,
+                    (double)free_b / 1073741824.0);
+        return 0;
+    }
+    if (cudaMalloc((void **)&g_bbvram_base, (size_t)need) != cudaSuccess) {
+        (void)cudaGetLastError(); g_bbvram_base = NULL; return 0;
+    }
+    g_bbvram_ptr = (char **)calloc(g_bb_registry.n, sizeof(char *));
+    if (!g_bbvram_ptr) { (void)cudaFree(g_bbvram_base); g_bbvram_base = NULL; return 0; }
+
+    uint64_t cum = 0;
+    for (uint32_t i = 0; i < g_bb_registry.n; i++) {
+        const uint64_t off   = g_bb_registry.spans[i].off;
+        const uint64_t bytes = g_bb_registry.spans[i].bytes;
+        char *dst = g_bbvram_base + cum;
+        g_bbvram_ptr[i] = dst;
+        char *ram = bb_ram_lookup(off, bytes);   /* reuse a prior decode's host copy if present */
+        int ok;
+        if (ram) ok = (cudaMemcpyAsync(dst, ram, (size_t)bytes, cudaMemcpyHostToDevice,
+                                       g_model_upload_stream) == cudaSuccess);
+        else     ok = cuda_slotbank_one_component(off, bytes, dst);   /* O_DIRECT disk stage once */
+        if (ok) ok = (cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess);
+        if (!ok || !cuda_is_device_ptr(dst)) {
+            (void)cudaGetLastError();
+            (void)cudaFree(g_bbvram_base); g_bbvram_base = NULL;
+            free(g_bbvram_ptr); g_bbvram_ptr = NULL;
+            return 0;   /* best-effort: fall back to the ring */
+        }
+        cum += (bytes + 255ull) & ~255ull;
+    }
+    g_bbvram_bytes = need;
+    g_bbvram_ready = 1;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
+        fprintf(stderr, "ds4: CUDA backbone VRAM-resident: %u spans, %.2f GiB (dense backbone "
+                "never re-streams; per-token H2D and the output-head transient eliminated)\n",
+                g_bb_registry.n, (double)need / 1073741824.0);
+    return 1;
+}
+
+/* Resolve a backbone slice against the resident slab: binary-search the sorted
+   registry for the containing span (the same search as bbr_registry_contains) and
+   return that span's device base plus the intra-span byte offset. NULL if not
+   resident or the slice straddles a span boundary (caller falls back to the ring). */
+static const char *cuda_bbvram_resolve(uint64_t off, uint64_t bytes) {
+    if (g_bbvram_ready != 1) return NULL;
+    const bbr_registry *r = &g_bb_registry;
+    const uint64_t end = off + bytes;
+    if (end < off) return NULL;
+    uint32_t lo = 0, hi = r->n;
+    while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (r->spans[mid].off <= off) lo = mid + 1; else hi = mid; }
+    if (lo == 0) return NULL;
+    const bbr_span *s = &r->spans[lo - 1];
+    if (off >= s->off && end <= s->off + s->bytes) return g_bbvram_ptr[lo - 1] + (off - s->off);
+    return NULL;
+}
+
 /* PHASE 3 resolver: serve a backbone weight slice from the per-layer ring.
    Returns a TRUE device pointer (no host pointer ever), or NULL meaning "not
    backbone -> caller continues its normal resolution chain". The bytes streamed
@@ -1395,6 +1539,18 @@ static int cuda_slotbank_fill(uint32_t s, uint64_t gate_off, uint64_t up_off, ui
 static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char *what) {
     if (!g_bb_registry_inited || bytes == 0) return NULL;
     if (!bbr_registry_contains(&g_bb_registry, off, bytes)) return NULL;  /* not backbone */
+
+    /* Bigmem: if the dense backbone is VRAM-resident, return the persistent slab
+       pointer directly -- no ring, no disk, no host-RAM cache, and no output-head
+       transient. cuda_bbvram_init is a one-shot (memoized); after it succeeds or
+       disables itself this is a single load + branch per resolve. */
+    if (cuda_bbvram_init()) {
+        const char *resident = cuda_bbvram_resolve(off, bytes);
+        if (resident) return resident;
+        /* contains() passed but the slice straddles a registered span boundary:
+           fall through to the ring path (still correct, just not resident). */
+    }
+
     if (!cuda_bbring_init()) return NULL;   /* ring alloc failed; let caller try fd path */
 
     const uint64_t aligned = (bytes + 255ull) & ~255ull;
@@ -1540,10 +1696,24 @@ static void cuda_expram_init(void) {
        pool < avail-margin < avail-10 invariant keeps it inside expram_cap_bytes's clamp. */
     {
         const char *envset = getenv("DS4_CUDA_EXPERT_RAM_CACHE_GB");
-        if (!(envset && envset[0]) && g_model_n_layer && g_model_n_total_expert) {
+        const int bigmem = ds4_gpu_bigmem();
+        /* Bigmem treats an explicit DS4_CUDA_EXPERT_RAM_CACHE_GB as a FLOOR, not a
+           ceiling: the full-pool auto-grow still fires (it only ever grows, since
+           the test is pool > cap) so a conservative explicit value cannot keep the
+           disk tier alive by accident. Without bigmem it stays env-unset-only to
+           preserve the original behavior. An explicit "0" already disabled the tier
+           before reaching here, so disable is still respected. */
+        if ((bigmem || !(envset && envset[0])) && g_model_n_layer && g_model_n_total_expert) {
             const uint64_t pool   = (uint64_t)g_model_n_layer * g_model_n_total_expert * slot;
-            const uint64_t margin = 16ull * 1073741824ull;   /* backbone(~9G) + OS + activations */
             const uint64_t avail  = host_mem_available_bytes();
+            /* margin = backbone host pin + OS + activations. Bigmem scales it from
+               available RAM (the flat 16 GiB was tuned for the 31 GiB baseline) so a
+               near-RAM-sized pool can still go fully resident. */
+            uint64_t margin = 16ull * 1073741824ull;
+            if (bigmem && avail) {
+                const uint64_t frac = avail / 10u;            /* ~10% of MemAvailable */
+                margin = frac < 8ull * 1073741824ull ? 8ull * 1073741824ull : frac;
+            }
             if (avail && pool > cap && pool + margin <= avail) {
                 cap = pool;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
@@ -2062,11 +2232,16 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
-     * demand-paged behavior for this one long-lived allocation class only. */
-    const uint64_t huge_kv = 8ull * 1073741824ull;
+     * demand-paged behavior for this one long-lived allocation class only.
+     * Bigmem raises these fixed tripwires (tuned for the 6 GiB rig) so that on a
+     * large card a normal-context KV cache stays in fast device VRAM; the
+     * free-VRAM check below still routes a KV/context that would not fit to
+     * managed memory, which on a discrete GPU pages to host RAM. That is exactly
+     * the chosen policy: VRAM for normal contexts, spill to RAM only when huge. */
+    const uint64_t huge_kv = ds4_gpu_bigmem() ? 32ull * 1073741824ull : 8ull * 1073741824ull;
     if (kv_cache_bytes >= huge_kv) return 1;
 
-    const uint64_t large_context = 8ull * 1073741824ull;
+    const uint64_t large_context = ds4_gpu_bigmem() ? 32ull * 1073741824ull : 8ull * 1073741824ull;
     if (context_bytes < large_context) return 0;
 
     size_t free_b = 0;
@@ -2307,7 +2482,16 @@ extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
     const uint64_t slot_bytes = n_total * per_slot;
     const uint64_t ring       = cuda_bbring_size_bytes();
     const uint64_t headroom   = 768ull * 1024ull * 1024ull;      /* output transient + driver + frag */
-    return slot_bytes + ring + headroom;
+    /* Bigmem: the VRAM-resident backbone slab is cudaMalloc'd lazily during the
+       forward (after graph alloc), so cudaMemGetInfo at graph-alloc time still
+       counts it as free. Subtract it here so the prefill cap leaves room and the
+       activation buffers + backbone slab cannot together overcommit VRAM. */
+    uint64_t bbvram = g_bbvram_bytes;
+    if (bbvram == 0 && ds4_gpu_bigmem() && g_bb_registry_inited) {
+        for (uint32_t i = 0; i < g_bb_registry.n; i++)
+            bbvram += (g_bb_registry.spans[i].bytes + 255ull) & ~255ull;
+    }
+    return slot_bytes + ring + headroom + bbvram;
 }
 
 /* Arm (decode) or disarm (batch prefill) the backbone host RAM cache. The decode

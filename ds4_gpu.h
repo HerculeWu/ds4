@@ -52,6 +52,17 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_expert);
 void ds4_gpu_print_memory_report(const char *label);
 
+/* Scale-up ("big memory") profile gate. True when compiled with -DDS4_BIGMEM
+   (make cuda-bigmem) OR the runtime DS4_BIGMEM env is set to a non-"0" value
+   (the env wins either way, so a bigmem binary can be A/B'd with DS4_BIGMEM=0).
+   It only RAISES the defaults of the existing DS4_CUDA_* sizing knobs -- every
+   one still overrides it -- and never forks the inference path (CLAUDE.md: no
+   permanent semantic variants behind flags). On a large GPU/host it biases the
+   engine to keep the dense backbone VRAM-resident, the full routed-expert pool
+   RAM-resident, and KV in device VRAM, collapsing SSD->RAM->VRAM toward 2-tier
+   without lowering the small-hardware floor. Returns 0 on non-CUDA builds. */
+int ds4_gpu_bigmem(void);
+
 /* =========================================================================
  * Phase 3 backbone streaming tier (CUDA only; no-ops elsewhere).
  * ========================================================================= */

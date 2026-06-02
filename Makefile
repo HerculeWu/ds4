@@ -27,13 +27,20 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+# Scale-up ("big memory") build: bias defaults toward using a large GPU/host
+# aggressively (VRAM-resident backbone, full expert pool in RAM, KV in VRAM).
+# Only changes DS4_CUDA_* knob DEFAULTS; every knob (and runtime DS4_BIGMEM) still
+# overrides. Appended (not assigned) so NVCC_ARCH_FLAGS is preserved.
+ifeq ($(BIGMEM),1)
+NVCCFLAGS += -DDS4_BIGMEM
+endif
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 CORE_OBJS = ds4.o ds4_cuda.o
 CPU_CORE_OBJS = ds4_cpu.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression cuda-slotbank-test
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-bigmem cuda-regression cuda-slotbank-test
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -76,6 +83,9 @@ help:
 	@echo "DS4 build targets:"
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
+	@echo "  make cuda-bigmem         Build CUDA in scale-up mode for a large GPU + host RAM"
+	@echo "                           (VRAM-resident backbone, full expert pool in RAM, KV in VRAM;"
+	@echo "                            equivalent to BIGMEM=1, or runtime DS4_BIGMEM=1 on any build)"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
@@ -86,6 +96,11 @@ cuda-spark:
 
 cuda-generic:
 	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+
+# Scale-up build for a large GPU + large host RAM (e.g. A40 48 GB + 128 GB).
+# Defaults to native arch; override with `make cuda-bigmem CUDA_ARCH=sm_86`.
+cuda-bigmem:
+	$(MAKE) ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=$(if $(strip $(CUDA_ARCH)),$(CUDA_ARCH),native) BIGMEM=1
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \
