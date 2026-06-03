@@ -9288,7 +9288,14 @@ static bool metal_graph_ensure_ffn_out(ds4_gpu_graph *g) {
 
 static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     if (!g->batch_ffn_out) {
-        g->batch_ffn_out = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float));
+        /* Multi-GPU: this lazy prefill scratch must be managed too -- it is read/written
+           by whichever device runs the layer that triggers directional steering, and it
+           is allocated on first use (potentially while a non-device-0 layer is active).
+           Managed lets it settle on the active device; plain device memory on 1 GPU. */
+        const uint64_t bytes = (uint64_t)g->prefill_cap * DS4_N_EMBD * sizeof(float);
+        g->batch_ffn_out = (ds4_gpu_device_count() > 1)
+            ? ds4_gpu_tensor_alloc_managed(bytes)
+            : ds4_gpu_tensor_alloc(bytes);
     }
     return g->batch_ffn_out != NULL;
 }
@@ -9360,13 +9367,17 @@ static bool metal_graph_alloc_raw_cap(
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
-    /* Multi-GPU pipeline split (Phase 8): the single-token decode tensors must be
+    /* Multi-GPU pipeline split (Phase 8): the decode AND prefill tensors must be
        reachable from whichever device runs each layer. Forcing MANAGED (unified)
        memory lets each layer's KV/scratch settle on its owning device after first
        access, and the inter-layer carry migrate across the one device boundary, with
        no per-field duplication. On a 1-GPU build multi==false so everything stays
-       device-local exactly as before -> byte-identical AND perf-identical. (The
-       prefill/batch tensors are NOT converted; prefill runs wholly on device 0.) */
+       device-local exactly as before -> byte-identical AND perf-identical. (Phase 8.4:
+       the batch/prefill scratch below is ALSO managed when multi -- prefill is now
+       pipeline-split per layer like decode, so a device-1 prefill kernel must not
+       dereference a device-0-pinned cudaMalloc buffer. Every batch_* tensor a layer
+       touches -- including prefill_tokens, which the per-layer router reads on-device --
+       becomes managed so it migrates to the active device on first touch.) */
     const bool multi = ds4_gpu_device_count() > 1;
     const bool managed_kv_cache =
         multi || ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
@@ -9528,44 +9539,52 @@ static bool metal_graph_alloc_raw_cap(
     }
     #undef ALLOC_DS
 
-    g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
-    g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_hc_mix = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
-    g->batch_hc_split = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
-    g->batch_attn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_attn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
-    g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
-    g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
-    g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
-    g->batch_comp_sc = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
-    g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
-    g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
-    g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
-    g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
-    g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_group_tmp = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
-    g->batch_low_tmp = ds4_gpu_tensor_alloc(pc * DS4_N_LORA_O * sizeof(float));
-    g->batch_after_attn_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_ffn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_ffn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_shared_gate = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_up = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_mid = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
-    g->batch_shared_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_router_logits = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
-    g->batch_router_probs = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
-    g->batch_router_selected = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
-    g->batch_router_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
-    g->batch_routed_gate = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_up = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-    g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    /* ALLOC_DS_BATCH: managed (unified) when multi-GPU so a layer's prefill scratch is
+       reachable from whichever device runs that layer (prefill is pipeline-split per
+       layer in metal_graph_prefill_layer_major); plain device memory on 1 GPU (the
+       graph is built with device 0 active, so these would otherwise be device-0-pinned
+       cudaMalloc buffers and a device-1 prefill kernel/cuBLAS call on them is an illegal
+       cross-device access without P2P). Mirrors the decode ALLOC_DS block above. */
+    #define ALLOC_DS_BATCH(bytes) (multi ? ds4_gpu_tensor_alloc_managed(bytes) : ds4_gpu_tensor_alloc(bytes))
+    g->prefill_tokens = ALLOC_DS_BATCH(pc * sizeof(int32_t));
+    g->batch_cur_hc = ALLOC_DS_BATCH(pc * hc_dim * sizeof(float));
+    g->batch_next_hc = ALLOC_DS_BATCH(pc * hc_dim * sizeof(float));
+    g->batch_flat_hc = ALLOC_DS_BATCH(pc * hc_dim * sizeof(float));
+    g->batch_hc_mix = ALLOC_DS_BATCH(pc * mix_hc * sizeof(float));
+    g->batch_hc_split = ALLOC_DS_BATCH(pc * mix_hc * sizeof(float));
+    g->batch_attn_cur = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_attn_norm = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_qr = ALLOC_DS_BATCH(pc * q_rank * sizeof(float));
+    g->batch_qr_norm = ALLOC_DS_BATCH(pc * q_rank * sizeof(float));
+    g->batch_q = ALLOC_DS_BATCH(pc * q_dim * sizeof(float));
+    g->batch_kv_raw = ALLOC_DS_BATCH(pc * DS4_N_HEAD_DIM * sizeof(float));
+    g->batch_kv = ALLOC_DS_BATCH(pc * DS4_N_HEAD_DIM * sizeof(float));
+    g->batch_comp_kv = ALLOC_DS_BATCH(pc * comp_width_max * sizeof(float));
+    g->batch_comp_sc = ALLOC_DS_BATCH(pc * comp_width_max * sizeof(float));
+    g->batch_indexer_q = ALLOC_DS_BATCH(pc * indexer_q_dim * sizeof(float));
+    g->batch_indexer_weights = ALLOC_DS_BATCH(pc * DS4_N_INDEXER_HEAD * sizeof(float));
+    g->batch_heads = ALLOC_DS_BATCH(pc * q_dim * sizeof(float));
+    g->batch_attn_low = ALLOC_DS_BATCH(pc * low_dim * sizeof(float));
+    g->batch_attn_out = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_group_tmp = ALLOC_DS_BATCH(pc * group_dim * sizeof(float));
+    g->batch_low_tmp = ALLOC_DS_BATCH(pc * DS4_N_LORA_O * sizeof(float));
+    g->batch_after_attn_hc = ALLOC_DS_BATCH(pc * hc_dim * sizeof(float));
+    g->batch_ffn_cur = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_ffn_norm = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_shared_gate = ALLOC_DS_BATCH(pc * shared_dim * sizeof(float));
+    g->batch_shared_up = ALLOC_DS_BATCH(pc * shared_dim * sizeof(float));
+    g->batch_shared_mid = ALLOC_DS_BATCH(pc * shared_dim * sizeof(float));
+    g->batch_shared_out = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_router_logits = ALLOC_DS_BATCH(pc * DS4_N_EXPERT * sizeof(float));
+    g->batch_router_probs = ALLOC_DS_BATCH(pc * DS4_N_EXPERT * sizeof(float));
+    g->batch_router_selected = ALLOC_DS_BATCH(pc * DS4_N_EXPERT_USED * sizeof(int));
+    g->batch_router_weights = ALLOC_DS_BATCH(pc * DS4_N_EXPERT_USED * sizeof(float));
+    g->batch_routed_gate = ALLOC_DS_BATCH(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->batch_routed_up = ALLOC_DS_BATCH(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->batch_routed_mid = ALLOC_DS_BATCH(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
+    g->batch_routed_down = ALLOC_DS_BATCH(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
+    g->batch_routed_out = ALLOC_DS_BATCH(pc * DS4_N_EMBD * sizeof(float));
+    #undef ALLOC_DS_BATCH
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
@@ -14163,6 +14182,20 @@ static bool metal_graph_prefill_layer_major(
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
 
+    /* Multi-GPU pipeline split (Phase 8.4): prefill routes each layer to its owning
+       device exactly like decode, so each card builds its OWN backbone slab + expert
+       slotbank for ITS layers DURING prefill -- not lazily mid-decode, which crashed
+       (device 1 had no resident weights, only migrated managed scratch). Start on
+       layer 0's device (device 0, which owns token_embd) so the prompt-token upload,
+       kernel warmup, and embedding upload below all run there; the per-layer loop then
+       routes each layer to its owner. No-op on 1 GPU (device_count()==1 maps every
+       layer to device 0, so prefill_cur_dev stays 0 and no switch ever fires). */
+    int prefill_cur_dev = 0;
+    if (ds4_gpu_device_count() > 1) {
+        prefill_cur_dev = ds4_gpu_layer_device(0);
+        ds4_gpu_set_active_device(prefill_cur_dev);
+    }
+
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
@@ -14181,8 +14214,16 @@ static bool metal_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
+    /* Multi-GPU must take the per-layer command path: ds4_gpu_begin_commands is a no-op
+       and end/flush/synchronize drain only the CURRENT device, so the whole-graph branch
+       (one begin/end around all layers) cannot switch devices mid-scope -- it would leave
+       the prior device's work undrained across a cudaSetDevice. Forcing the split path
+       makes every device switch land on an already-drained command boundary, matching
+       decode. device_count()>1 is false on 1 GPU, so the whole-graph fast path is still
+       selected for short prompts there -> 1-GPU perf unchanged. */
     const bool split_commands = split_profile || throttle || callback_split ||
-                                n_tokens > 2048 || imatrix != NULL;
+                                n_tokens > 2048 || imatrix != NULL ||
+                                ds4_gpu_device_count() > 1;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
@@ -14293,6 +14334,20 @@ static bool metal_graph_prefill_layer_major(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* Run this layer wholly on its owning device. At a device boundary, drain the
+           producing device first so the (managed) inter-layer carry batch_cur_hc is
+           complete before the next device touches it; it then migrates on first access.
+           Whole-layer atomicity means no FP accumulation crosses the boundary (prefill's
+           expert down-sum is already atomicAdd-nondeterministic, so this never affects the
+           decode-only byte-identical oracle). Inert when every layer maps to device 0. */
+        if (ds4_gpu_device_count() > 1) {
+            int ld = ds4_gpu_layer_device(il);
+            if (ld != prefill_cur_dev) {
+                ds4_gpu_synchronize();
+                ds4_gpu_set_active_device(ld);
+                prefill_cur_dev = ld;
+            }
+        }
         double layer_elapsed = 0.0;
         if (split_profile) {
             const double t_attn0 = now_sec();
@@ -14363,6 +14418,9 @@ static bool metal_graph_prefill_layer_major(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
             }
+            /* A mid-loop failure may leave a non-zero device active; restore device 0 so
+               the caller's teardown / next prefill start from the known entry device. */
+            if (ds4_gpu_device_count() > 1) ds4_gpu_set_active_device(0);
             return false;
         }
         graph_power_note_prefill_layer(g, il, layer_elapsed);
@@ -14409,6 +14467,15 @@ static bool metal_graph_prefill_layer_major(
     const double t_head_done = profile ? now_sec() : 0.0;
     g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
+    /* Multi-GPU: the output head ran on the last layer's device (it owns output_norm/
+       head, and its input last_hc -- a row view of the managed batch_cur_hc -- already
+       migrated there). Drain it and restore device 0 so the logits read-back and the
+       subsequent decode loop start from the known entry device; g->logits is managed
+       when multi, so the read below is correct from any device. No-op on 1 GPU. */
+    if (ds4_gpu_device_count() > 1) {
+        ds4_gpu_synchronize();
+        ds4_gpu_set_active_device(0);
+    }
     if (!ok) return false;
 
     const double t_before_read = profile ? now_sec() : 0.0;
@@ -14607,6 +14674,19 @@ static bool metal_graph_verify_suffix_tops(
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
+
+    /* Phase 8.4 multi-GPU gap (fail loud, no silent garbage): this MTP speculative
+       verifier runs the batch layer kernels over ALL layers with no per-layer device
+       switch, so under the pipeline split it would run device-1-owned layers on device 0
+       and dereference device-1-resident expert/backbone weights. MTP is currently blocked
+       on this gguf (no mtp.* tensors), so this path is unreachable today; if MTP is ever
+       wired, it must get the same per-layer routing as decode/prefill before enabling it
+       on >1 GPU. Refuse rather than crash/garbage. No-op on 1 GPU. */
+    if (ds4_gpu_device_count() > 1) {
+        fprintf(stderr, "ds4: MTP speculative verify is not yet multi-GPU pipeline-split "
+                "aware; run with DS4_CUDA_DEVICES=1 or disable MTP\n");
+        return false;
+    }
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,

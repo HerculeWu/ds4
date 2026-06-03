@@ -54,7 +54,10 @@ run(){
   local memfile="$WORK/$tag.mem"; : > "$memfile"
   ( while :; do nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
         | paste -sd' ' >> "$memfile"; sleep 1; done ) & local mp=$!
-  env DS4_BIGMEM=1 DS4_TOKEN_TIMING=1 "$@" \
+  # DS4_CUDA_WEIGHT_CACHE_VERBOSE surfaces per-device backbone-VRAM residency and
+  # slotbank sizing so we can SEE whether each card actually built its tiers (the
+  # multi-GPU residency win) or fell back to streaming/lazy build mid-decode.
+  env DS4_BIGMEM=1 DS4_TOKEN_TIMING=1 DS4_CUDA_WEIGHT_CACHE_VERBOSE=1 "$@" \
       "$DS4_BIN" -m "$DS4_MODEL" -c "$CTX" -n "$NTOK" --temp 0 -sys "$SYS" -p "$PROMPT" \
       > "$WORK/$tag.out" 2> "$WORK/$tag.err"
   local rc=$?
@@ -80,12 +83,28 @@ run multi; RC2=$?
 say "  exit: $RC2"
 grep -E "CUDA device [0-9]|multi-GPU layer split|P2P" "$WORK/multi.err" | sed 's/^/    /'
 
+# Per-device residency: did each card build its backbone slab + slotbank, or fall
+# back to streaming / a mid-decode lazy build? (DS4_CUDA_WEIGHT_CACHE_VERBOSE=1)
+say "  residency (multi):"
+grep -E "backbone VRAM-resident|residency skipped|slotbank|expert host-RAM|RAM tier" "$WORK/multi.err" \
+  | sed 's/^/    /' | head -20 || say "    (no residency lines)"
+
+# Surface the actual failure. A non-zero exit or a short/empty stdout means a
+# kernel died (illegal access / OOM / assert); the message is in stderr, not the
+# grep above — print its tail so the crash line is visible without re-running.
+errtail(){ say "  $1 stderr tail:"; tail -n 25 "$WORK/$2.err" | sed 's/^/    /'; }
+[ "$RC1" != 0 ] && errtail single single
+[ "$RC2" != 0 ] && errtail multi  multi
+
 rule; say "[4] CORRECTNESS  (single vs multi must be byte-identical, greedy)"
 if [ "$RC1" = 0 ] && [ "$RC2" = 0 ] && cmp -s "$WORK/single.out" "$WORK/multi.out"; then
   CORRECT="PASS (byte-identical)"
 else
   CORRECT="FAIL"
   say "  first diff:"; diff <(head -c 2000 "$WORK/single.out") <(head -c 2000 "$WORK/multi.out") | head -20 | sed 's/^/    /'
+  # If one side crashed, the diff above is misleading (it compares against a
+  # truncated/empty output); the stderr tail in [3] is the real cause.
+  { [ "$RC1" != 0 ] || [ "$RC2" != 0 ]; } && say "  NOTE: a run exited non-zero — see the stderr tail in [3]; this is a CRASH, not a logits drift."
 fi
 say "  $CORRECT"
 

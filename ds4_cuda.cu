@@ -1359,6 +1359,11 @@ static const char *cuda_model_range_ptr_from_fd(
    unchanged. n_slots is clamped to real free VRAM (NOT the UINT64_MAX env
    default). Asserts the slab fits before allocating. Fails loudly; never
    silently degrades, never falls back to host. */
+/* Count the decoder layers mapped to the active device (g_cur). The layer->device map
+   is defined far below; this is forward-declared so the slotbank pool clamp can size
+   each device's expert slab to only its shard when multi-GPU. 1 GPU => all layers. */
+static uint32_t cuda_device_owned_layer_count(void);
+
 static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
                               uint32_t min_slots) {
     if (g_slotbank_ready) return 1;
@@ -1410,7 +1415,13 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
        free for those tiers. No-op on small cards, where full_set*slot >> free, so
        the 6 GiB floor is unchanged. DS4_CUDA_WEIGHT_CACHE_LIMIT_GB still caps below. */
     if (ds4_gpu_bigmem() && g_model_n_layer && g_model_n_total_expert) {
-        const uint64_t pool_bytes = (uint64_t)g_model_n_layer * g_model_n_total_expert * slot;
+        /* Multi-GPU: this device serves ONLY the layers mapped to it (prefill and decode
+           both route per layer to their owner), so clamp the slab to ITS shard, not the
+           whole 43-layer pool. This right-sizes each card's expert slab (~half on a
+           2-card contiguous split) and leaves the rest of its VRAM free for the backbone
+           slab + KV -- the capacity win. On 1 GPU owned == n_layer => identical clamp. */
+        const uint32_t pool_layers = cuda_device_owned_layer_count();
+        const uint64_t pool_bytes = (uint64_t)pool_layers * g_model_n_total_expert * slot;
         if (pool_bytes && budget > pool_bytes) budget = pool_bytes;
     }
 
@@ -2623,6 +2634,21 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         g_model_fd_host_base = model_map;
     }
 
+    /* Multi-GPU early-out (Phase 8.4): do NOT copy the model to one device, nor
+       host-register/zero-copy-map the whole mapping. cuda_model_range_ptr short-circuits
+       ALL weight resolution to a single device-0 base pointer when g_model_device_owned
+       or g_model_registered is set -- that bypasses the per-device bbvram + slotbank
+       residency the pipeline split depends on, and would have a device-1 kernel read
+       device-0 memory. Leaving both flags 0 routes every device through the per-device
+       VRAM-resident tiers (the same path the single-GPU bigmem run already uses, since
+       host-registering an 81 GB mapping fails on this hardware anyway). 1 GPU never
+       takes this branch, so its behavior is unchanged. */
+    if (g_ngpu > 1) {
+        fprintf(stderr, "ds4: multi-GPU (%d devices): skipping full-model copy/host-register; "
+                "backbone + experts resolve per-device via the VRAM-resident tiers\n", g_ngpu);
+        return 1;
+    }
+
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
     if (copy_env && copy_env[0]) {
         void *dev = NULL;
@@ -2914,6 +2940,17 @@ static void cuda_build_layer_device_map(void) {
 extern "C" int ds4_gpu_layer_device(uint32_t layer) {
     if (!g_layer_device_built) cuda_build_layer_device_map();
     return (layer < 256) ? (int)g_layer_device[layer] : 0;
+}
+
+/* Layers mapped to the active device (g_cur). Forward-declared above the slotbank so
+   each device's expert slab is clamped to its shard. 1 GPU => the full pool, unchanged. */
+static uint32_t cuda_device_owned_layer_count(void) {
+    if (g_ngpu <= 1) return g_model_n_layer;
+    if (!g_layer_device_built) cuda_build_layer_device_map();
+    uint32_t c = 0;
+    for (uint32_t il = 0; il < g_model_n_layer && il < 256; il++)
+        if (g_layer_device[il] == g_cur) c++;
+    return c ? c : 1;   /* never zero the pool clamp */
 }
 
 extern "C" int ds4_gpu_device_count(void) { return g_ngpu; }
