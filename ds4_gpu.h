@@ -52,28 +52,6 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_expert);
 void ds4_gpu_print_memory_report(const char *label);
 
-/* Multi-GPU pipeline split (Phase 8). Single node, N CUDA devices: contiguous
-   blocks of decoder layers map to devices; the per-layer decode loop calls
-   ds4_gpu_set_active_device() at each layer boundary so all of that layer's
-   attention/router/MoE compute + KV run on the owning device (NO floating-point
-   accumulation ever crosses a device boundary -- only the inter-layer carry is
-   copied). ds4_gpu_device_count() returns 1 on a single-GPU build, where the layer
-   map is all-zero and these are no-ops -> the single-GPU path is unchanged. */
-int  ds4_gpu_device_count(void);
-int  ds4_gpu_layer_device(uint32_t layer);
-int  ds4_gpu_set_active_device(int dev);
-
-/* Scale-up ("big memory") profile gate. True when compiled with -DDS4_BIGMEM
-   (make cuda-bigmem) OR the runtime DS4_BIGMEM env is set to a non-"0" value
-   (the env wins either way, so a bigmem binary can be A/B'd with DS4_BIGMEM=0).
-   It only RAISES the defaults of the existing DS4_CUDA_* sizing knobs -- every
-   one still overrides it -- and never forks the inference path (CLAUDE.md: no
-   permanent semantic variants behind flags). On a large GPU/host it biases the
-   engine to keep the dense backbone VRAM-resident, the full routed-expert pool
-   RAM-resident, and KV in device VRAM, collapsing SSD->RAM->VRAM toward 2-tier
-   without lowering the small-hardware floor. Returns 0 on non-CUDA builds. */
-int ds4_gpu_bigmem(void);
-
 /* =========================================================================
  * Phase 3 backbone streaming tier (CUDA only; no-ops elsewhere).
  * ========================================================================= */
@@ -82,12 +60,6 @@ int ds4_gpu_bigmem(void);
 void ds4_gpu_register_backbone_offset(uint64_t offset, uint64_t bytes);
 /* Sort the registry; call exactly once after all offsets are registered. */
 void ds4_gpu_finalize_backbone_offsets(void);
-/* Record one routed layer's GGUF expert offsets + per-expert strides (identical to
-   the decode routed-MoE call) so the CUDA host-RAM tier can eager-prefill the whole
-   expert pool at decode start, collapsing the cold-disk warmup ramp to PCIe serves.
-   Call once per layer at model open. CUDA-only; the caller guards the call site. */
-void ds4_gpu_register_expert_layer(uint32_t layer, uint64_t gate_off, uint64_t up_off,
-        uint64_t down_off, uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
 /* Reset the per-layer ring epoch (logically frees all ring bytes). Call at the
    top of each layer's kernel sequence (decode and batch). */
 void ds4_gpu_backbone_layer_begin(uint32_t layer);

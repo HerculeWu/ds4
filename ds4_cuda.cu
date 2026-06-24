@@ -71,107 +71,15 @@ typedef struct {
 #include "ds4_slotbank_core.h"
 #include "ds4_backbone_ring_core.h"
 
-/* Scale-up profile gate -- see ds4_gpu.h. Memoized. The runtime DS4_BIGMEM env
-   wins over the compile-time -DDS4_BIGMEM default in both directions, so a
-   bigmem binary can be turned off with DS4_BIGMEM=0 and a normal binary turned
-   on with DS4_BIGMEM=1. Every per-tier knob below only consults this to pick a
-   more aggressive DEFAULT; the matching DS4_CUDA_* env still overrides per tier,
-   and no inference path is forked. */
-extern "C" int ds4_gpu_bigmem(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("DS4_BIGMEM");
-        if (e && e[0]) {
-            v = !(e[0] == '0' && e[1] == '\0');   /* explicit runtime override */
-        } else {
-#ifdef DS4_BIGMEM
-            v = 1;                                  /* compiled-in default */
-#else
-            v = 0;
-#endif
-        }
-    }
-    return v;
-}
-
-/* ---- Per-device runtime state (multi-GPU pipeline split, Phase 8) --------------
-   Every device-resident runtime tier is held per-device in g_dev[]; g_cur names
-   the device currently being driven. The macros below are the "current-device
-   view": existing single-device code (g_cublas, g_slotbank, g_bbvram_base, ...)
-   compiles UNCHANGED and resolves to g_dev[g_cur].*, so a 1-GPU build (g_ngpu==1,
-   g_cur always 0) is byte-for-byte the previous single-global path. The pipeline
-   layer split (Phase 3) assigns each contiguous block of layers to one device and
-   sets g_cur at the layer boundary; the ONLY thing that crosses a device boundary
-   is a bit-exact copy of the inter-layer carry -- NO floating-point accumulation
-   ever crosses (that is the byte-identical invariant; see moe_down_sum6 below).
-   Code that drives a SPECIFIC device (init/cleanup loops) writes g_dev[d].* directly.
-   NOT per-device (kept as single instances, deliberately outside this struct):
-   model-derived slot geometry (g_slot_bytes, g_slot_*_off/_bytes, topology hints)
-   is identical on every device; the host-shared tiers (g_expram, g_bb_ram,
-   g_expoff registry, g_model_stage* staging, the model map/ranges/q8 caches) live
-   in host RAM or are written once at load and read by whichever device owns the
-   consuming layer. */
-#define DS4_MAX_GPUS 8
-struct gpu_dev {
-    cublasHandle_t cublas;          int      cublas_ready;
-    cudaStream_t   upload_stream;            /* H2D tier fills + the one named-stream kernel */
-    cudaStream_t   prefetch_stream;          /* model prefetch (HMM/ATS) */
-    cuda_slotbank  slotbank;        char    *slotbank_base;  int slotbank_ready;  /* VRAM expert LRU */
-    int32_t       *slot_id_scratch; uint32_t slot_id_scratch_cap;                 /* selected[]->slot remap */
-    char          *bbring_base;     uint64_t bbring_bytes;   bbr_ring_state bbring;  int bbring_inited;
-    char          *bbvram_base;     char   **bbvram_ptr;     uint64_t bbvram_bytes;  int bbvram_ready;
-    void          *bb_transient;             /* output-head oversized transient (last device) */
-    char          *embd_rows_dev;   uint64_t embd_rows_cap;                       /* embed gather (dev0) */
-    void          *cuda_tmp;        uint64_t cuda_tmp_bytes;                      /* generic device scratch */
-};
-static gpu_dev g_dev[DS4_MAX_GPUS];
-static int     g_ngpu = 1;   /* device count; 1 => the unchanged single-GPU path */
-static int     g_cur  = 0;   /* active device index into g_dev[] (== current CUDA device) */
-
-#define g_cublas                (g_dev[g_cur].cublas)
-#define g_cublas_ready          (g_dev[g_cur].cublas_ready)
-#define g_model_upload_stream   (g_dev[g_cur].upload_stream)
-#define g_model_prefetch_stream (g_dev[g_cur].prefetch_stream)
-#define g_slotbank              (g_dev[g_cur].slotbank)
-#define g_slotbank_base         (g_dev[g_cur].slotbank_base)
-#define g_slotbank_ready        (g_dev[g_cur].slotbank_ready)
-#define g_slot_id_scratch       (g_dev[g_cur].slot_id_scratch)
-#define g_slot_id_scratch_cap   (g_dev[g_cur].slot_id_scratch_cap)
-#define g_bbring_base           (g_dev[g_cur].bbring_base)
-#define g_bbring_bytes          (g_dev[g_cur].bbring_bytes)
-#define g_bbring                (g_dev[g_cur].bbring)
-#define g_bbring_inited         (g_dev[g_cur].bbring_inited)
-#define g_bbvram_base           (g_dev[g_cur].bbvram_base)
-#define g_bbvram_ptr            (g_dev[g_cur].bbvram_ptr)
-#define g_bbvram_bytes          (g_dev[g_cur].bbvram_bytes)
-#define g_bbvram_ready          (g_dev[g_cur].bbvram_ready)
-#define g_bb_transient          (g_dev[g_cur].bb_transient)
-#define g_embd_rows_dev         (g_dev[g_cur].embd_rows_dev)
-#define g_embd_rows_cap         (g_dev[g_cur].embd_rows_cap)
-#define g_cuda_tmp              (g_dev[g_cur].cuda_tmp)
-#define g_cuda_tmp_bytes        (g_dev[g_cur].cuda_tmp_bytes)
-
 /* ---- Phase 3 backbone streaming statics (share the slotbank staging pipeline) ---- */
 static bbr_registry   g_bb_registry;          /* populated at model open */
 static int            g_bb_registry_inited = 0;
 
-/* g_bbring_base/_bytes/_inited, g_bbring (bbr_ring_state) and g_bb_transient are
-   per-device -> moved into gpu_dev (see the macro block above). */
-
-/* Bigmem: persistent VRAM-resident backbone. The default path re-uploads the
-   whole dense backbone (~8.8 GiB on Flash) H2D every token through the epoch ring
-   (and a per-token cudaMalloc for the oversized output head). When VRAM is large
-   that is wasteful: a one-time upload of every registered backbone span into a
-   permanent device slab lets the resolver return a stable device pointer forever,
-   eliminating the per-token H2D AND the output-head transient. The slab mirrors
-   the sorted bbr_registry 1:1 (g_bbvram_ptr[i] is span i's device base, in the
-   same order), so a lookup is the same binary search as bbr_registry_contains
-   plus an intra-span byte offset. Best-effort and gated by ds4_gpu_bigmem() /
-   DS4_CUDA_BACKBONE_VRAM; on any failure g_bbvram_ready = -1 and the backbone
-   simply streams through the ring as before. The uploaded bytes are byte-identical
-   to the streamed bytes, so prefill and decode both stay golden. */
-/* g_bbvram_base/_ptr/_bytes/_ready are per-device -> moved into gpu_dev (macro block
-   above). Each device's slab holds only the backbone spans for the layers it owns. */
+static char           *g_bbring_base = NULL;     /* one cudaMalloc */
+static uint64_t        g_bbring_bytes = 0;
+static bbr_ring_state  g_bbring;                 /* from ds4_backbone_ring_core.h */
+static int             g_bbring_inited = 0;
+static void           *g_bb_transient = NULL;    /* output-head oversized buffer */
 
 /* Phase 4: backbone host RAM residency cache.
    The 8.8 GB dense backbone (attn proj, shared expert, norms, router, etc.) is
@@ -293,10 +201,10 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
-/* g_model_prefetch_stream, g_model_upload_stream, g_cublas, g_cublas_ready are
-   per-device -> moved into gpu_dev (macro block above). g_quality_mode is the
-   model-wide math-mode policy and stays a single instance (applied identically to
-   every per-device cublas handle so dense matmuls round the same on each card). */
+static cudaStream_t g_model_prefetch_stream;
+static cudaStream_t g_model_upload_stream;
+static cublasHandle_t g_cublas;
+static int g_cublas_ready;
 static int g_quality_mode;
 
 struct cuda_model_range {
@@ -341,9 +249,8 @@ static uint64_t g_model_range_bytes;
    expert's gate|up|down contiguously and byte-identical to the source GGUF block
    so the kernels' intra-expert row stride is unchanged. Defined here but not yet
    wired into routed_moe_launch (that is Task 6). */
-/* g_slotbank, g_slotbank_base, g_slotbank_ready and g_slot_id_scratch[_cap] are
-   per-device -> moved into gpu_dev (macro block above). The slot GEOMETRY below is
-   model-derived and identical on every device, so it stays a single instance. */
+static cuda_slotbank g_slotbank;
+static char    *g_slotbank_base;       /* single cudaMalloc'd slab */
 static uint64_t g_slot_bytes;          /* per-slot size (gate+up+down, 256-aligned) */
 static uint64_t g_slot_gate_off;       /* intra-slot byte offsets */
 static uint64_t g_slot_up_off;
@@ -351,8 +258,11 @@ static uint64_t g_slot_down_off;
 static uint64_t g_slot_gate_bytes;     /* per-expert component sizes (== source GGUF) */
 static uint64_t g_slot_up_bytes;
 static uint64_t g_slot_down_bytes;
+static int      g_slotbank_ready;
 static uint32_t g_model_n_layer;        /* topology hint (set at model open); 0 = unknown */
 static uint32_t g_model_n_total_expert; /* routed experts per layer; 0 = unknown */
+static int32_t *g_slot_id_scratch;        /* persistent device buffer: selected[]->slot remap */
+static uint32_t g_slot_id_scratch_cap;    /* capacity in int32 elements */
 
 /* Phase 5: host-RAM second tier for routed experts -- the SSD->RAM->VRAM "RAM"
    tier. Structurally identical to the VRAM g_slotbank (same cuda_slotbank, same
@@ -369,29 +279,6 @@ static uint32_t g_model_n_total_expert; /* routed experts per layer; 0 = unknown
 static cuda_slotbank g_expram;        /* host-backed; *_dev fields point into the pinned host slab */
 static char    *g_expram_base;        /* single cudaHostAlloc'd pinned host slab */
 static int      g_expram_ready;       /* 0 = uninit, 1 = ready, -1 = disabled (alloc failed / 0 cap) */
-
-/* Eager-prefill: stream the WHOLE routed-expert pool disk->host RAM at the start of
-   decode so the warmup ramp (cold per-token disk fills, ~17-19s on the first token
-   alone) collapses to fast PCIe RAM->VRAM serves. Per-layer GGUF offsets/strides are
-   registered at model open (ds4_gpu_register_expert_layer) -- the SAME values the
-   decode routed-MoE call passes -- so the loader reads bytes byte-identical to the
-   lazy disk path. ensure_union validates each registration against the live offsets
-   before serving (cuda_expoff_matches), so a registration drift aborts loudly rather
-   than ever serving a wrong expert. OPT-IN (DS4_CUDA_EXPERT_PREFILL=1, default OFF):
-   measured net-negative below ~4600 decode tokens because it reads the whole pool
-   (~3x the typical working set) up front, so the lazy reactive tier stays the default;
-   eager only wins long / flat-latency sessions. Floor-safe: a pure no-op unless opted
-   in AND the tier is sized to hold the full pool (so no eager entry can ever be
-   evicted). Index g_expoff[] by layer index il. */
-typedef struct {
-    uint64_t gate_off, up_off, down_off;   /* GGUF abs_offset of each layer's expert tensor */
-    uint64_t gate_expert_bytes;            /* per-expert stride (gate AND up share it) */
-    uint64_t down_expert_bytes;            /* per-expert stride for down */
-} cuda_expert_layer_off;
-static cuda_expert_layer_off g_expoff[256];   /* indexed by layer il; gate_expert_bytes==0 => unregistered */
-static uint32_t g_expoff_n = 0;               /* highest registered layer + 1 */
-static int g_expram_prefilled = 0;            /* one-shot: bulk load attempted */
-static int g_expram_prefill_active = 0;       /* 1 once the bulk load actually populated the tier */
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -400,7 +287,8 @@ static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
-/* g_cuda_tmp[_bytes] is per-device device scratch -> moved into gpu_dev. */
+static void *g_cuda_tmp;
+static uint64_t g_cuda_tmp_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -1359,11 +1247,6 @@ static const char *cuda_model_range_ptr_from_fd(
    unchanged. n_slots is clamped to real free VRAM (NOT the UINT64_MAX env
    default). Asserts the slab fits before allocating. Fails loudly; never
    silently degrades, never falls back to host. */
-/* Count the decoder layers mapped to the active device (g_cur). The layer->device map
-   is defined far below; this is forward-declared so the slotbank pool clamp can size
-   each device's expert slab to only its shard when multi-GPU. 1 GPU => all layers. */
-static uint32_t cuda_device_owned_layer_count(void);
-
 static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
                               uint32_t min_slots) {
     if (g_slotbank_ready) return 1;
@@ -1391,12 +1274,7 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
        margin so the head always fits without env tuning. The ring is already
        allocated before slotbank init (layer-0 attention resolves first), so it
        is excluded from `free` and need not be re-counted here. */
-    /* cuBLAS workspace + driver + frag. Bigmem scales it with the card (the flat
-       256 MiB was tuned for the 6 GiB rig) so a large GPU keeps proportional
-       headroom for transients / a wider prefill+cuBLAS working set. */
-    const uint64_t reserve_scratch = ds4_gpu_bigmem()
-        ? (((uint64_t)total_b / 64ull) > 256ull * 1048576ull ? (uint64_t)total_b / 64ull : 256ull * 1048576ull)
-        : 256ull * 1048576ull;
+    const uint64_t reserve_scratch = 256ull * 1048576ull;  /* cuBLAS workspace + driver + frag */
     uint64_t max_transient = g_bb_registry_inited
         ? bbr_registry_max_bytes(&g_bb_registry) : 0;
     uint64_t reserve = max_transient + reserve_scratch;
@@ -1406,24 +1284,6 @@ static int cuda_slotbank_init(uint64_t gate_b, uint64_t up_b, uint64_t down_b,
     uint64_t usable = (free_b > reserve) ? ((uint64_t)free_b - reserve) : 0;
     uint64_t env_limit = cuda_model_cache_limit_bytes();   /* UINT64_MAX if unset */
     uint64_t budget = (env_limit < usable) ? env_limit : usable;
-
-    /* Bigmem: never claim more VRAM than the whole routed-expert set can use. The
-       slab is otherwise greedy (all free - reserve); on a large card that grabs
-       tens of GiB of slots beyond the full pool for no benefit (experts past the
-       full set are never touched) while starving the VRAM-resident backbone and
-       the KV cache. Clamp the budget to the full pool so the rest of VRAM stays
-       free for those tiers. No-op on small cards, where full_set*slot >> free, so
-       the 6 GiB floor is unchanged. DS4_CUDA_WEIGHT_CACHE_LIMIT_GB still caps below. */
-    if (ds4_gpu_bigmem() && g_model_n_layer && g_model_n_total_expert) {
-        /* Multi-GPU: this device serves ONLY the layers mapped to it (prefill and decode
-           both route per layer to their owner), so clamp the slab to ITS shard, not the
-           whole 43-layer pool. This right-sizes each card's expert slab (~half on a
-           2-card contiguous split) and leaves the rest of its VRAM free for the backbone
-           slab + KV -- the capacity win. On 1 GPU owned == n_layer => identical clamp. */
-        const uint32_t pool_layers = cuda_device_owned_layer_count();
-        const uint64_t pool_bytes = (uint64_t)pool_layers * g_model_n_total_expert * slot;
-        if (pool_bytes && budget > pool_bytes) budget = pool_bytes;
-    }
 
     uint32_t n = (uint32_t)(budget / slot);
     if (n < min_slots) {
@@ -1527,93 +1387,6 @@ static int cuda_slotbank_fill(uint32_t s, uint64_t gate_off, uint64_t up_off, ui
     return 1;
 }
 
-/* Bigmem backbone residency (see g_bbvram_* globals). Lazily allocate the device
-   slab on the first backbone resolve: by then the model fd / staging pool / upload
-   stream are ready, the KV cache is already allocated so cudaMemGetInfo reflects
-   it, and this runs BEFORE the lazy slotbank init so the slotbank's free_b excludes
-   the slab. Uploads every registered span once; a per-span stream sync keeps the
-   shared staging buffers safe across spans (one-time cost). Returns 1 if resident. */
-static int cuda_bbvram_init(void) {
-    if (g_bbvram_ready) return g_bbvram_ready == 1;   /* 1 ready / -1 disabled: done */
-    g_bbvram_ready = -1;                              /* pessimistic until proven resident */
-
-    int want = ds4_gpu_bigmem();
-    const char *e = getenv("DS4_CUDA_BACKBONE_VRAM");
-    if (e && e[0]) want = !(e[0] == '0' && e[1] == '\0');   /* explicit per-tier override */
-    if (!want) return 0;
-    if (!g_bb_registry_inited || g_bb_registry.n == 0) return 0;
-    if (!g_bb_registry.sorted) bbr_registry_sort(&g_bb_registry);
-
-    uint64_t need = 0;
-    for (uint32_t i = 0; i < g_bb_registry.n; i++)
-        need += (g_bb_registry.spans[i].bytes + 255ull) & ~255ull;
-    if (need == 0) return 0;
-
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
-    /* Leave room for the lazy slotbank (>= one per-layer union), KV growth, and
-       driver/frag; the slotbank then sizes itself from the reduced free VRAM. */
-    const uint64_t headroom = 2ull * 1073741824ull;
-    if ((uint64_t)free_b < need + headroom) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
-            fprintf(stderr, "ds4: CUDA backbone VRAM residency skipped: need %.2f GiB + %.2f GiB "
-                    "headroom > free %.2f GiB (backbone streams through the ring as before)\n",
-                    (double)need / 1073741824.0, (double)headroom / 1073741824.0,
-                    (double)free_b / 1073741824.0);
-        return 0;
-    }
-    if (cudaMalloc((void **)&g_bbvram_base, (size_t)need) != cudaSuccess) {
-        (void)cudaGetLastError(); g_bbvram_base = NULL; return 0;
-    }
-    g_bbvram_ptr = (char **)calloc(g_bb_registry.n, sizeof(char *));
-    if (!g_bbvram_ptr) { (void)cudaFree(g_bbvram_base); g_bbvram_base = NULL; return 0; }
-
-    uint64_t cum = 0;
-    for (uint32_t i = 0; i < g_bb_registry.n; i++) {
-        const uint64_t off   = g_bb_registry.spans[i].off;
-        const uint64_t bytes = g_bb_registry.spans[i].bytes;
-        char *dst = g_bbvram_base + cum;
-        g_bbvram_ptr[i] = dst;
-        char *ram = bb_ram_lookup(off, bytes);   /* reuse a prior decode's host copy if present */
-        int ok;
-        if (ram) ok = (cudaMemcpyAsync(dst, ram, (size_t)bytes, cudaMemcpyHostToDevice,
-                                       g_model_upload_stream) == cudaSuccess);
-        else     ok = cuda_slotbank_one_component(off, bytes, dst);   /* O_DIRECT disk stage once */
-        if (ok) ok = (cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess);
-        if (!ok || !cuda_is_device_ptr(dst)) {
-            (void)cudaGetLastError();
-            (void)cudaFree(g_bbvram_base); g_bbvram_base = NULL;
-            free(g_bbvram_ptr); g_bbvram_ptr = NULL;
-            return 0;   /* best-effort: fall back to the ring */
-        }
-        cum += (bytes + 255ull) & ~255ull;
-    }
-    g_bbvram_bytes = need;
-    g_bbvram_ready = 1;
-    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
-        fprintf(stderr, "ds4: CUDA backbone VRAM-resident: %u spans, %.2f GiB (dense backbone "
-                "never re-streams; per-token H2D and the output-head transient eliminated)\n",
-                g_bb_registry.n, (double)need / 1073741824.0);
-    return 1;
-}
-
-/* Resolve a backbone slice against the resident slab: binary-search the sorted
-   registry for the containing span (the same search as bbr_registry_contains) and
-   return that span's device base plus the intra-span byte offset. NULL if not
-   resident or the slice straddles a span boundary (caller falls back to the ring). */
-static const char *cuda_bbvram_resolve(uint64_t off, uint64_t bytes) {
-    if (g_bbvram_ready != 1) return NULL;
-    const bbr_registry *r = &g_bb_registry;
-    const uint64_t end = off + bytes;
-    if (end < off) return NULL;
-    uint32_t lo = 0, hi = r->n;
-    while (lo < hi) { uint32_t mid = lo + (hi - lo) / 2; if (r->spans[mid].off <= off) lo = mid + 1; else hi = mid; }
-    if (lo == 0) return NULL;
-    const bbr_span *s = &r->spans[lo - 1];
-    if (off >= s->off && end <= s->off + s->bytes) return g_bbvram_ptr[lo - 1] + (off - s->off);
-    return NULL;
-}
-
 /* PHASE 3 resolver: serve a backbone weight slice from the per-layer ring.
    Returns a TRUE device pointer (no host pointer ever), or NULL meaning "not
    backbone -> caller continues its normal resolution chain". The bytes streamed
@@ -1622,18 +1395,6 @@ static const char *cuda_bbvram_resolve(uint64_t off, uint64_t bytes) {
 static const char *cuda_bbring_resolve(uint64_t off, uint64_t bytes, const char *what) {
     if (!g_bb_registry_inited || bytes == 0) return NULL;
     if (!bbr_registry_contains(&g_bb_registry, off, bytes)) return NULL;  /* not backbone */
-
-    /* Bigmem: if the dense backbone is VRAM-resident, return the persistent slab
-       pointer directly -- no ring, no disk, no host-RAM cache, and no output-head
-       transient. cuda_bbvram_init is a one-shot (memoized); after it succeeds or
-       disables itself this is a single load + branch per resolve. */
-    if (cuda_bbvram_init()) {
-        const char *resident = cuda_bbvram_resolve(off, bytes);
-        if (resident) return resident;
-        /* contains() passed but the slice straddles a registered span boundary:
-           fall through to the ring path (still correct, just not resident). */
-    }
-
     if (!cuda_bbring_init()) return NULL;   /* ring alloc failed; let caller try fd path */
 
     const uint64_t aligned = (bytes + 255ull) & ~255ull;
@@ -1779,24 +1540,10 @@ static void cuda_expram_init(void) {
        pool < avail-margin < avail-10 invariant keeps it inside expram_cap_bytes's clamp. */
     {
         const char *envset = getenv("DS4_CUDA_EXPERT_RAM_CACHE_GB");
-        const int bigmem = ds4_gpu_bigmem();
-        /* Bigmem treats an explicit DS4_CUDA_EXPERT_RAM_CACHE_GB as a FLOOR, not a
-           ceiling: the full-pool auto-grow still fires (it only ever grows, since
-           the test is pool > cap) so a conservative explicit value cannot keep the
-           disk tier alive by accident. Without bigmem it stays env-unset-only to
-           preserve the original behavior. An explicit "0" already disabled the tier
-           before reaching here, so disable is still respected. */
-        if ((bigmem || !(envset && envset[0])) && g_model_n_layer && g_model_n_total_expert) {
+        if (!(envset && envset[0]) && g_model_n_layer && g_model_n_total_expert) {
             const uint64_t pool   = (uint64_t)g_model_n_layer * g_model_n_total_expert * slot;
+            const uint64_t margin = 16ull * 1073741824ull;   /* backbone(~9G) + OS + activations */
             const uint64_t avail  = host_mem_available_bytes();
-            /* margin = backbone host pin + OS + activations. Bigmem scales it from
-               available RAM (the flat 16 GiB was tuned for the 31 GiB baseline) so a
-               near-RAM-sized pool can still go fully resident. */
-            uint64_t margin = 16ull * 1073741824ull;
-            if (bigmem && avail) {
-                const uint64_t frac = avail / 10u;            /* ~10% of MemAvailable */
-                margin = frac < 8ull * 1073741824ull ? 8ull * 1073741824ull : frac;
-            }
             if (avail && pool > cap && pool + margin <= avail) {
                 cap = pool;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
@@ -1855,10 +1602,6 @@ static void cuda_expram_init(void) {
 static int cuda_expram_serve(uint32_t host_s, uint32_t vram_s) {
     const cuda_expert_slot *h = &g_expram.slots[host_s];
     cuda_expert_slot *d = &g_slotbank.slots[vram_s];
-    /* Never serve a slot whose three components are not fully present: a host slot
-       is hash-inserted (and thus lookup-able) only after a complete fill sets
-       resident=1, so this guards against any future partial-fill insertion path. */
-    if (!h->resident) return 0;
     if (cudaMemcpyAsync(d->gate_dev, h->gate_dev, (size_t)g_slot_gate_bytes,
                         cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
         cudaMemcpyAsync(d->up_dev,   h->up_dev,   (size_t)g_slot_up_bytes,
@@ -1896,110 +1639,6 @@ static void cuda_expram_capture(uint32_t vram_s, uint32_t layer, uint32_t eid) {
     sb_touch(&g_expram, hs);                     /* now the MRU end */
 }
 
-/* True iff layer's registered eager-prefill offsets match the live decode offsets.
-   The live offsets (ensure_union args) are the source of truth; this catches any
-   drift between the model-open registration and the routed-MoE call before a single
-   RAM serve. An unregistered layer (gate_expert_bytes==0) is treated as "no match"
-   so eager prefill simply stays off for it. */
-static int cuda_expoff_matches(uint32_t layer, uint64_t gate_off, uint64_t up_off,
-        uint64_t down_off, uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
-    if (layer >= 256u) return 0;
-    const cuda_expert_layer_off *e = &g_expoff[layer];
-    return e->gate_expert_bytes != 0 &&
-           e->gate_off == gate_off && e->up_off == up_off && e->down_off == down_off &&
-           e->gate_expert_bytes == gate_expert_bytes && e->down_expert_bytes == down_expert_bytes;
-}
-
-/* Eager-prefill helper: stream ONE expert component (gate/up/down) from the mmap'd
-   GGUF into a pinned-host slot via the same O_DIRECT staging primitive the lazy VRAM
-   fill uses (cuda_model_stage_read). Unlike cuda_slotbank_one_component (which issues
-   async H2D and needs the 4-slot event ring), the copy out of the stage here is a
-   synchronous host->host memcpy, so a single stage buffer is reused serially with no
-   device work and no event discipline. Returns 1 on success. */
-static int cuda_expram_fill_one_component(uint64_t off, uint64_t bytes, char *host_dst) {
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
-    uint64_t done = 0;
-    while (done < bytes) {
-        const uint64_t n = (bytes - done < chunk) ? (bytes - done) : chunk;
-        const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[0], g_model_stage_bytes, off + done, n, &payload))
-            return 0;
-        memcpy(host_dst + done, payload, (size_t)n);   /* host->host; stage free on return */
-        done += n;
-    }
-    return 1;
-}
-
-/* One-shot eager prefill of the host-RAM expert tier: stream EVERY routed expert
-   disk->host so the decode warmup ramp collapses to PCIe serves and disk stays inert
-   for the rest of the session. Mirrors cuda_expram_capture's slot bookkeeping exactly
-   (acquire/evict/fill/insert/touch) but fills from disk instead of D2H. Caller (the
-   first armed decode ensure_union) has already validated the current layer's offsets;
-   later layers re-validate at the top of ensure_union before any serve. Floor-safe:
-   returns immediately unless bigmem, the tier is live, and it is sized to the full
-   pool (so no eager entry is ever an eviction victim). */
-static void cuda_expram_prefill_all(void) {
-    if (g_expram_prefilled) return;
-    g_expram_prefilled = 1;                           /* attempt at most once */
-    /* OPT-IN ONLY (default OFF). Measured on A40: eager-loading the whole pool reads
-       ~3x the typical working set and pays it all up front, so it is net-negative
-       below ~4600 decode tokens -- the lazy reactive tier is the better default.
-       Enable (DS4_CUDA_EXPERT_PREFILL=1) for long sessions or when flat latency from
-       token 1 matters more than the one-time full-pool load. The full-pool residency
-       gate below still applies, so on a box where the pool does not fit RAM this is a
-       safe no-op even when opted in. */
-    const char *env = getenv("DS4_CUDA_EXPERT_PREFILL");
-    if (!(env && env[0] == '1')) return;               /* default OFF; =1 to enable */
-    if (g_expram_ready != 1) return;                   /* tier must be live */
-    if (g_slot_bytes == 0 || g_expoff_n == 0 || g_model_n_total_expert == 0) return;
-    /* Full-pool residency gate: only safe when the tier holds every expert, so the
-       LRU never evicts an eager-loaded entry (append-only for the session). When a
-       cudaHostAlloc shrink left the tier smaller, stay lazy and say so. */
-    const uint64_t full_set = (uint64_t)g_expoff_n * g_model_n_total_expert;
-    if ((uint64_t)g_expram.n_slots < full_set) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE"))
-            fprintf(stderr, "ds4: CUDA eager expert prefill skipped: tier %u slots < full pool %llu experts\n",
-                    g_expram.n_slots, (unsigned long long)full_set);
-        return;
-    }
-    const double t0 = cuda_wall_sec();
-    fprintf(stderr, "ds4: CUDA eager expert prefill (opt-in): streaming %.1f GiB (%llu experts) "
-            "disk->host RAM, one-time...\n",
-            (double)(full_set * g_slot_bytes) / 1073741824.0, (unsigned long long)full_set);
-    uint64_t loaded = 0, n_exp = 0;
-    for (uint32_t layer = 0; layer < g_expoff_n; layer++) {
-        const cuda_expert_layer_off *e = &g_expoff[layer];
-        if (e->gate_expert_bytes == 0) continue;       /* unregistered layer */
-        for (uint32_t eid = 0; eid < g_model_n_total_expert; eid++) {
-            if (sb_lookup(&g_expram, layer, eid) != SLOT_NIL) continue;  /* already resident */
-            uint32_t hs = sb_acquire(&g_expram);
-            if (hs == SLOT_NIL) goto done;             /* unreachable under the full_set gate */
-            sb_evict(&g_expram, hs);
-            cuda_expert_slot *h = &g_expram.slots[hs];
-            const uint64_t go  = e->gate_off + (uint64_t)eid * e->gate_expert_bytes;
-            const uint64_t uo  = e->up_off   + (uint64_t)eid * e->gate_expert_bytes;  /* up stride == gate */
-            const uint64_t dno = e->down_off + (uint64_t)eid * e->down_expert_bytes;
-            if (!cuda_expram_fill_one_component(go,  g_slot_gate_bytes, h->gate_dev) ||
-                !cuda_expram_fill_one_component(uo,  g_slot_up_bytes,   h->up_dev)   ||
-                !cuda_expram_fill_one_component(dno, g_slot_down_bytes, h->down_dev)) {
-                /* best-effort: leave the slot free (non-resident) so the lazy disk
-                   path still serves this expert; never insert a partial slot. */
-                continue;
-            }
-            h->layer = layer; h->expert_id = eid; h->resident = 1;
-            sb_hash_insert(&g_expram, hs);
-            sb_touch(&g_expram, hs);
-            loaded += g_slot_bytes; n_exp++;
-        }
-    }
-done:
-    g_expram_prefill_active = (n_exp > 0) ? 1 : 0;    /* arm the per-layer serve guard */
-    fprintf(stderr, "ds4: CUDA eager expert prefill loaded %.2f GiB (%llu experts) disk->host RAM in %.1fs\n",
-            (double)loaded / 1073741824.0, (unsigned long long)n_exp, cuda_wall_sec() - t0);
-}
-
 /* RESERVE phase. ids[] is the FULL n_ids = n_tokens*n_expert selected array
    (with duplicates). For each distinct (layer,eid) we hit-touch or miss-evict-fill;
    the hash map coalesces duplicates so each expert is uploaded at most once.
@@ -2021,35 +1660,11 @@ static int cuda_slotbank_ensure_union(uint32_t layer, const int32_t *ids, uint32
        layer tops), so prefill (armed=0) skips the tier and streams experts from
        disk, keeping the golden gate byte-identical. cap_slot/cap_eid queue the
        host-miss slots whose D2H capture must wait until after the batched sync. */
-    /* Eager-prefill serve guard: once the bulk loader has populated the host tier
-       from the model-open registration, every layer must prove its registered
-       offsets still match the live decode offsets BEFORE any RAM serve. A mismatch
-       means the registration drifted from the routed-MoE call -> abort rather than
-       ever serve a wrong expert. Runs before the serve loop below, so bad bytes
-       (even if eager-loaded) can never reach the kernels. */
-    if (g_expram_prefill_active &&
-        !cuda_expoff_matches(layer, gate_layer_off, up_layer_off, down_layer_off,
-                             gate_expert_bytes, down_expert_bytes)) {
-        fprintf(stderr, "ds4: FATAL eager-prefill offset mismatch L%u; aborting before serve\n", layer);
-        return 0;
-    }
     int use_expram = 0;
     uint32_t *cap_slot = NULL, *cap_eid = NULL, cap_n = 0;
     if (g_bb_cache_armed && expram_enabled()) {
         cuda_expram_init();                      /* lazy; slot geometry is set by now */
         if (g_expram_ready == 1) {
-            /* One-shot eager prefill on the first armed decode call. Validate THIS
-               layer's registered offsets against the live ones first; the bulk load
-               then trusts the uniform per-layer math and every later layer is
-               re-validated by the serve guard above. A failed match (or unregistered
-               layer) just leaves the tier lazy. No-op unless bigmem + full pool. */
-            if (!g_expram_prefilled) {
-                if (cuda_expoff_matches(layer, gate_layer_off, up_layer_off, down_layer_off,
-                                        gate_expert_bytes, down_expert_bytes))
-                    cuda_expram_prefill_all();
-                else
-                    g_expram_prefilled = 1;      /* unregistered/mismatched first layer: stay lazy */
-            }
             cap_slot = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
             cap_eid  = (uint32_t *)malloc((size_t)n_ids * sizeof(uint32_t));
             use_expram = (cap_slot && cap_eid);
@@ -2321,112 +1936,33 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
-/* Math mode is a MODEL-WIDE policy (TF32 vs default), applied IDENTICALLY to every
-   per-device cublas handle: a per-device divergence would make dense matmuls round
-   differently on one card and silently break the byte-identical decode. */
-static cublasMath_t cuda_math_mode(void) {
-    return (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-               ? CUBLAS_DEFAULT_MATH
-               : CUBLAS_TF32_TENSOR_OP_MATH;
-}
-
-/* Device count = min(visible devices, DS4_CUDA_DEVICES cap, DS4_MAX_GPUS).
-   DS4_CUDA_DEVICES is a diagnostic CAP, not a semantic flag (CLAUDE.md): it lets
-   the 2-card box force the single-GPU topology (DS4_CUDA_DEVICES=1) to reproduce
-   the byte-identical 1-GPU oracle ON the only hardware that has two cards. Default
-   = all visible devices. */
-static int cuda_pick_ngpu(void) {
-    int n = 0;
-    if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) { (void)cudaGetLastError(); n = 1; }
-    if (n > DS4_MAX_GPUS) n = DS4_MAX_GPUS;
-    const char *e = getenv("DS4_CUDA_DEVICES");
-    if (e && e[0]) {
-        char *p = NULL; long v = strtol(e, &p, 10);
-        if (p != e && v >= 1 && v < n) n = (int)v;
-    }
-    return n;
-}
-
 extern "C" int ds4_gpu_init(void) {
-    g_ngpu = cuda_pick_ngpu();
-    /* Create a cublas handle on every device with an identical math mode. Streams
-       and the VRAM tiers stay LAZILY created per device, so a 1-GPU run (g_ngpu==1)
-       touches exactly the same device/allocation sequence as before -> byte-identical. */
-    const cublasMath_t math_mode = cuda_math_mode();
-    for (int d = 0; d < g_ngpu; d++) {
-        if (!cuda_ok(cudaSetDevice(d), "set device")) return 0;
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA device %d/%d: %s (sm_%d%d)\n",
-                    d, g_ngpu, prop.name, prop.major, prop.minor);
-        }
-        if (!g_dev[d].cublas_ready) {
-            if (!cublas_ok(cublasCreate(&g_dev[d].cublas), "create handle")) return 0;
-            (void)cublasSetMathMode(g_dev[d].cublas, math_mode);
-            g_dev[d].cublas_ready = 1;
-        }
+    int dev = 0;
+    if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
+                prop.name, prop.major, prop.minor);
     }
-    /* Pipeline layer split (Phase 3) copies the inter-layer carry across the single
-       device boundary; enable peer access pairwise so that copy can be a direct
-       cudaMemcpyPeer. Where a pair has no P2P we log it and host-bounce at copy time
-       (still bit-exact). Best-effort; skipped entirely on a 1-GPU box. */
-    if (g_ngpu > 1) {
-        for (int i = 0; i < g_ngpu; i++) {
-            if (cudaSetDevice(i) != cudaSuccess) { (void)cudaGetLastError(); continue; }
-            for (int j = 0; j < g_ngpu; j++) {
-                if (i == j) continue;
-                int can = 0;
-                if (cudaDeviceCanAccessPeer(&can, i, j) == cudaSuccess && can) {
-                    cudaError_t pe = cudaDeviceEnablePeerAccess(j, 0);
-                    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled)
-                        (void)cudaGetLastError();
-                } else {
-                    (void)cudaGetLastError();
-                    fprintf(stderr, "ds4: P2P %d->%d unavailable; layer-boundary carry will host-bounce\n", i, j);
-                }
-            }
-        }
+    if (!g_cublas_ready) {
+        if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
+        const cublasMath_t math_mode =
+            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+                ? CUBLAS_DEFAULT_MATH
+                : CUBLAS_TF32_TENSOR_OP_MATH;
+        (void)cublasSetMathMode(g_cublas, math_mode);
+        g_cublas_ready = 1;
     }
-    g_cur = 0;
-    return cuda_ok(cudaSetDevice(0), "set device 0");
+    return 1;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    /* Per-device runtime teardown. Every card got a cublas handle at init and may
-       have lazily created an upload/prefetch stream and a cuda_tmp scratch while it
-       was the active device, so destroy those on their OWN device. (The big
-       process-lifetime VRAM tiers -- slotbank/bbvram/bbring slabs -- are reclaimed at
-       process exit / by their own reset paths and are not touched here.) On a 1-GPU
-       box this loop runs once for device 0, exactly as before. */
-    int prev = 0; (void)cudaGetDevice(&prev);
-    for (int d = 0; d < g_ngpu; d++) {
-        if (cudaSetDevice(d) != cudaSuccess) { (void)cudaGetLastError(); continue; }
-        (void)cudaDeviceSynchronize();
-        if (g_dev[d].cublas_ready) {
-            (void)cublasDestroy(g_dev[d].cublas);
-            g_dev[d].cublas_ready = 0;
-            g_dev[d].cublas = NULL;
-        }
-        if (g_dev[d].cuda_tmp) {
-            (void)cudaFree(g_dev[d].cuda_tmp);
-            g_dev[d].cuda_tmp = NULL;
-            g_dev[d].cuda_tmp_bytes = 0;
-        }
-        if (g_dev[d].upload_stream) {
-            (void)cudaStreamDestroy(g_dev[d].upload_stream);
-            g_dev[d].upload_stream = NULL;
-        }
-        if (g_dev[d].prefetch_stream) {
-            (void)cudaStreamDestroy(g_dev[d].prefetch_stream);
-            g_dev[d].prefetch_stream = NULL;
-        }
+    (void)cudaDeviceSynchronize();
+    if (g_cublas_ready) {
+        (void)cublasDestroy(g_cublas);
+        g_cublas_ready = 0;
+        g_cublas = NULL;
     }
-    (void)cudaSetDevice(0);
-    g_cur = 0;
-
-    /* Host-shared / model-map teardown -- device-agnostic, done once. The q8 and
-       model-device frees below target device-0 allocations (model load device), so
-       they run after the loop has restored device 0 as current. */
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -2437,6 +1973,11 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
+    if (g_cuda_tmp) {
+        (void)cudaFree(g_cuda_tmp);
+        g_cuda_tmp = NULL;
+        g_cuda_tmp_bytes = 0;
+    }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -2449,7 +1990,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     g_model_stage_bytes = 0;
-    (void)prev;
+    if (g_model_upload_stream) {
+        (void)cudaStreamDestroy(g_model_upload_stream);
+        g_model_upload_stream = NULL;
+    }
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
     }
@@ -2470,6 +2014,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     g_model_direct_align = 1;
     g_model_file_size = 0;
+    if (g_model_prefetch_stream) {
+        (void)cudaStreamDestroy(g_model_prefetch_stream);
+        g_model_prefetch_stream = NULL;
+    }
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -2514,16 +2062,11 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
 
     /* Very large KV caches are where device-only cudaMalloc() can make a
      * unified-memory machine unresponsive.  Managed memory restores the old
-     * demand-paged behavior for this one long-lived allocation class only.
-     * Bigmem raises these fixed tripwires (tuned for the 6 GiB rig) so that on a
-     * large card a normal-context KV cache stays in fast device VRAM; the
-     * free-VRAM check below still routes a KV/context that would not fit to
-     * managed memory, which on a discrete GPU pages to host RAM. That is exactly
-     * the chosen policy: VRAM for normal contexts, spill to RAM only when huge. */
-    const uint64_t huge_kv = ds4_gpu_bigmem() ? 32ull * 1073741824ull : 8ull * 1073741824ull;
+     * demand-paged behavior for this one long-lived allocation class only. */
+    const uint64_t huge_kv = 8ull * 1073741824ull;
     if (kv_cache_bytes >= huge_kv) return 1;
 
-    const uint64_t large_context = ds4_gpu_bigmem() ? 32ull * 1073741824ull : 8ull * 1073741824ull;
+    const uint64_t large_context = 8ull * 1073741824ull;
     if (context_bytes < large_context) return 0;
 
     size_t free_b = 0;
@@ -2634,21 +2177,6 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         g_model_fd_host_base = model_map;
     }
 
-    /* Multi-GPU early-out (Phase 8.4): do NOT copy the model to one device, nor
-       host-register/zero-copy-map the whole mapping. cuda_model_range_ptr short-circuits
-       ALL weight resolution to a single device-0 base pointer when g_model_device_owned
-       or g_model_registered is set -- that bypasses the per-device bbvram + slotbank
-       residency the pipeline split depends on, and would have a device-1 kernel read
-       device-0 memory. Leaving both flags 0 routes every device through the per-device
-       VRAM-resident tiers (the same path the single-GPU bigmem run already uses, since
-       host-registering an 81 GB mapping fails on this hardware anyway). 1 GPU never
-       takes this branch, so its behavior is unchanged. */
-    if (g_ngpu > 1) {
-        fprintf(stderr, "ds4: multi-GPU (%d devices): skipping full-model copy/host-register; "
-                "backbone + experts resolve per-device via the VRAM-resident tiers\n", g_ngpu);
-        return 1;
-    }
-
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
     if (copy_env && copy_env[0]) {
         void *dev = NULL;
@@ -2749,24 +2277,6 @@ extern "C" void ds4_gpu_register_backbone_offset(uint64_t offset, uint64_t bytes
     bbr_registry_add(&g_bb_registry, offset, bytes);
 }
 
-/* Eager-prefill registration: record one routed layer's GGUF expert offsets and
-   per-expert strides at model open. The caller (ds4.c weights_bind) MUST pass the
-   identical values the decode routed-MoE call uses -- ffn_{gate,up,down}_exps
-   abs_offset and the gate/down expert-byte strides -- so the bulk loader reads
-   bytes byte-identical to the lazy disk path. Pure bookkeeping; no I/O here. The
-   CUDA side asserts these against the live decode offsets before any RAM serve. */
-extern "C" void ds4_gpu_register_expert_layer(uint32_t layer,
-        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
-        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
-    if (layer >= 256u || gate_expert_bytes == 0 || down_expert_bytes == 0) return;
-    g_expoff[layer].gate_off = gate_off;
-    g_expoff[layer].up_off = up_off;
-    g_expoff[layer].down_off = down_off;
-    g_expoff[layer].gate_expert_bytes = gate_expert_bytes;
-    g_expoff[layer].down_expert_bytes = down_expert_bytes;
-    if (layer + 1u > g_expoff_n) g_expoff_n = layer + 1u;
-}
-
 extern "C" void ds4_gpu_finalize_backbone_offsets(void) {
     if (!g_bb_registry_inited) {
         bbr_registry_init(&g_bb_registry, 16);
@@ -2797,16 +2307,7 @@ extern "C" uint64_t ds4_gpu_planned_reserve_bytes(void) {
     const uint64_t slot_bytes = n_total * per_slot;
     const uint64_t ring       = cuda_bbring_size_bytes();
     const uint64_t headroom   = 768ull * 1024ull * 1024ull;      /* output transient + driver + frag */
-    /* Bigmem: the VRAM-resident backbone slab is cudaMalloc'd lazily during the
-       forward (after graph alloc), so cudaMemGetInfo at graph-alloc time still
-       counts it as free. Subtract it here so the prefill cap leaves room and the
-       activation buffers + backbone slab cannot together overcommit VRAM. */
-    uint64_t bbvram = g_bbvram_bytes;
-    if (bbvram == 0 && ds4_gpu_bigmem() && g_bb_registry_inited) {
-        for (uint32_t i = 0; i < g_bb_registry.n; i++)
-            bbvram += (g_bb_registry.spans[i].bytes + 255ull) & ~255ull;
-    }
-    return slot_bytes + ring + headroom + bbvram;
+    return slot_bytes + ring + headroom;
 }
 
 /* Arm (decode) or disarm (batch prefill) the backbone host RAM cache. The decode
@@ -2866,105 +2367,18 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
-    /* Re-apply the math mode to EVERY device's handle (not just g_cur's): this
-       setter runs after ds4_gpu_init, and leaving any card on the init-time mode
-       would diverge its dense-matmul rounding from the others -> non-bit-identical. */
-    const cublasMath_t math_mode = cuda_math_mode();
-    for (int d = 0; d < g_ngpu; d++) {
-        if (g_dev[d].cublas_ready) (void)cublasSetMathMode(g_dev[d].cublas, math_mode);
+    if (g_cublas_ready) {
+        const cublasMath_t math_mode =
+            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
+                ? CUBLAS_DEFAULT_MATH
+                : CUBLAS_TF32_TENSOR_OP_MATH;
+        (void)cublasSetMathMode(g_cublas, math_mode);
     }
 }
 
 extern "C" void ds4_gpu_set_model_topology(uint32_t n_layer, uint32_t n_total_expert) {
     g_model_n_layer = n_layer;
     g_model_n_total_expert = n_total_expert;
-}
-
-/* ---- Phase 8.2: layer -> device assignment (pipeline split) --------------------
-   Contiguous blocks of decoder layers map to devices, balanced by cumulative
-   per-layer routed-expert bytes (the dominant VRAM term; backbone + KV are roughly
-   uniform per layer). token_embd rides on the first device (owns the embed/layer 0)
-   and the output head on the last device; each adds ~1 GiB to its endpoint, which
-   the Phase-3 fit check accounts for -- the split itself does not perturb for it
-   because the endpoint cost is small next to a ~39 GiB expert shard. With g_ngpu==1
-   every layer maps to device 0 (the boundary set is empty), so the single-GPU path
-   is unchanged. Built once, lazily, after the expert registry is populated. */
-static int8_t g_layer_device[256];
-static int    g_layer_device_built = 0;
-
-static uint64_t cuda_layer_expert_bytes(uint32_t il) {
-    if (il >= 256) return 0;
-    const cuda_expert_layer_off *e = &g_expoff[il];
-    if (e->gate_expert_bytes == 0) return 0;   /* unregistered -> caller uses uniform 1 */
-    /* gate + up (same per-expert stride) + down, times the routed-expert count. */
-    return ((uint64_t)2 * e->gate_expert_bytes + e->down_expert_bytes) *
-           (uint64_t)g_model_n_total_expert;
-}
-
-static void cuda_build_layer_device_map(void) {
-    if (g_layer_device_built) return;
-    const uint32_t n = g_model_n_layer;
-    if (n == 0) return;                          /* topology not set yet -- retry later */
-    for (uint32_t il = 0; il < n && il < 256; il++) g_layer_device[il] = 0;
-    if (g_ngpu > 1) {
-        uint64_t total = 0;
-        for (uint32_t il = 0; il < n; il++) {
-            uint64_t b = cuda_layer_expert_bytes(il);
-            total += (b ? b : 1);
-        }
-        const uint64_t target = total / (uint64_t)g_ngpu;   /* per-device byte goal */
-        uint64_t acc = 0; int dev = 0;
-        for (uint32_t il = 0; il < n && il < 256; il++) {
-            g_layer_device[il] = (int8_t)dev;
-            uint64_t b = cuda_layer_expert_bytes(il); acc += (b ? b : 1);
-            /* Close this device once it reaches its byte goal, but leave at least
-               one layer for each remaining device (contiguous + monotone). */
-            if (dev < g_ngpu - 1 && acc >= target &&
-                (int)(n - il - 1) >= (g_ngpu - dev - 1)) {
-                dev++; acc = 0;
-            }
-        }
-    }
-    g_layer_device_built = 1;
-    if (g_ngpu > 1 || getenv("DS4_CUDA_MULTIGPU_VERBOSE")) {
-        for (int d = 0; d < g_ngpu; d++) {
-            int lo = -1, hi = -1;
-            for (uint32_t il = 0; il < n; il++)
-                if (g_layer_device[il] == d) { if (lo < 0) lo = (int)il; hi = (int)il; }
-            fprintf(stderr, "ds4: multi-GPU layer split: device %d owns layers %d..%d\n", d, lo, hi);
-        }
-    }
-}
-
-/* Owning device of a decoder layer (0 on a 1-GPU build). Lazily builds the map. */
-extern "C" int ds4_gpu_layer_device(uint32_t layer) {
-    if (!g_layer_device_built) cuda_build_layer_device_map();
-    return (layer < 256) ? (int)g_layer_device[layer] : 0;
-}
-
-/* Layers mapped to the active device (g_cur). Forward-declared above the slotbank so
-   each device's expert slab is clamped to its shard. 1 GPU => the full pool, unchanged. */
-static uint32_t cuda_device_owned_layer_count(void) {
-    if (g_ngpu <= 1) return g_model_n_layer;
-    if (!g_layer_device_built) cuda_build_layer_device_map();
-    uint32_t c = 0;
-    for (uint32_t il = 0; il < g_model_n_layer && il < 256; il++)
-        if (g_layer_device[il] == g_cur) c++;
-    return c ? c : 1;   /* never zero the pool clamp */
-}
-
-extern "C" int ds4_gpu_device_count(void) { return g_ngpu; }
-
-/* Switch the active device for the pipeline split: sets BOTH the CUDA current
-   device and g_cur (the per-device tier view), so every g_* tier macro and every
-   subsequent kernel/cublas/alloc targets `dev`. On a 1-GPU build this is only ever
-   called with 0 (a no-op switch). The caller is the per-layer decode loop, which
-   sets the device once at each layer boundary (Phase 3). */
-extern "C" int ds4_gpu_set_active_device(int dev) {
-    if (dev < 0 || dev >= g_ngpu) return 0;
-    if (!cuda_ok(cudaSetDevice(dev), "set active device")) return 0;
-    g_cur = dev;
-    return 1;
 }
 
 /* Loud death for a model/hardware config the specialized CUDA kernels cannot run.
@@ -6903,7 +6317,8 @@ __global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint3
    only needs the active token rows. We stream just those rows into a small
    device buffer (reused across steps), then run a row-base kernel that indexes
    from row 0. This avoids a 1.059 GiB ring/transient alloc per embed call. */
-/* g_embd_rows_dev/_cap are per-device (embed runs on dev0) -> moved into gpu_dev. */
+static char    *g_embd_rows_dev = NULL;
+static uint64_t g_embd_rows_cap = 0;
 
 static char *cuda_embd_rows_ensure(uint64_t bytes) {
     if (bytes <= g_embd_rows_cap && g_embd_rows_dev) return g_embd_rows_dev;
