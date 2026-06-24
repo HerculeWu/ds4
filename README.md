@@ -109,6 +109,14 @@ That's roughly a **7×** climb end to end, on a six-year-old gaming GPU. If
 modern desktop — more VRAM, more RAM, a faster SSD — has more of every resource
 the cache feeds on, and the same code simply runs warmer and quicker on it.
 
+Those bullets are whole-stream CLI averages, so the slow cache-warming tokens
+drag them down. The hot GPU decode window is faster: `ds4-bench` measured
+**1.10 t/s** generation on the same GTX 1660 Ti after a 2048-token CUDA prefill
+(`DS4_CUDA_SLOTBANK_RESERVE_MB=768 ./ds4-bench -m ds4flash.gguf --prompt-file
+speed-bench/promessi_sposi.txt --ctx-start 2048 --ctx-max 2048 --gen-tokens
+128`). That number excludes model load, prefill time, and benchmark
+save/restore; it is the "already warm, keep decoding" rate.
+
 🔒 Correctness was non-negotiable: decode with the cache **on** vs **off**
 produces **byte-identical** tokens (the cache changes only *where* a weight
 comes from, never its value), and the loud capability gates mean an unsupported
